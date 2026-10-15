@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Open Data Scraper</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <p class="kicker">Chrome extension</p>
+      <h1>Open Data Scraper</h1>
+      <p id="page" class="page">This tab</p>
+    </header>
+    <div class="row">
+      <button id="scrape" type="button" class="primary">Scrape this page</button>
+      <button id="crawl" type="button">Crawl next pages</button>
+    </div>
+    <div class="row">
+      <button id="stop" type="button">Stop</button>
+      <label class="limit">
+        Max pages
+        <input id="max" type="number" min="1" max="30" value="8" />
+      </label>
+    </div>
+    <label class="check">
+      <input id="oos" type="checkbox" />
+      Include sold-out rows
+    </label>
+    <p id="status" class="status" role="status">Open a product listing, then scrape or crawl.</p>
+    <p id="meta" class="meta"></p>
+    <div class="row">
+      <button id="md" type="button" disabled>Markdown</button>
+      <button id="csv" type="button" disabled>CSV</button>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,95 @@
+:root {
+  color-scheme: dark;
+  font: 13px/1.4 "Segoe UI", sans-serif;
+  background: #121410;
+  color: #f3f1ea;
+}
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 14px;
+  background: #121410;
+}
+
+header h1 {
+  margin: 2px 0 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.kicker {
+  margin: 0;
+  color: #73786c;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.page,
+.meta {
+  margin: 6px 0 0;
+  color: #a3a79a;
+  word-break: break-all;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+button,
+input {
+  font: inherit;
+  color: #f3f1ea;
+}
+
+button {
+  flex: 1;
+  min-height: 36px;
+  border: 1px solid #31342c;
+  border-radius: 8px;
+  background: #1b1d18;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.primary {
+  background: #d7dece;
+  color: #151710;
+  border-color: #d7dece;
+  font-weight: 600;
+}
+
+.check,
+.limit {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.limit {
+  flex: 1;
+  margin-top: 0;
+}
+
+input[type="number"] {
+  width: 64px;
+  min-height: 36px;
+  border: 1px solid #31342c;
+  border-radius: 8px;
+  background: #1b1d18;
+  padding: 0 8px;
+}
+
+.status {
+  margin: 12px 0 0;
+  color: #d7dece;
+}

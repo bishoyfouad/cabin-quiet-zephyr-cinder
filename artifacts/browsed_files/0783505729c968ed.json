@@ -1,0 +1,140 @@
+{
+  "sha": "a836ab91d7891ecd9a53572e95ae43de0e0e6a77",
+  "url": "https://api.github.com/repos/iblead/open-data-scraper/git/trees/a836ab91d7891ecd9a53572e95ae43de0e0e6a77",
+  "tree": [
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "06ecfcb85aa352adf1ee32161e89484196cfa1d4",
+      "size": 49,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/06ecfcb85aa352adf1ee32161e89484196cfa1d4"
+    },
+    {
+      "path": "LICENSE",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "f60fe55b794d5ed4bedf79f2d2711b53b2a4d5f8",
+      "size": 1087,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/f60fe55b794d5ed4bedf79f2d2711b53b2a4d5f8"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "8064f98cf6e02094d8b8f2452eda68abb423eff2",
+      "size": 4228,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/8064f98cf6e02094d8b8f2452eda68abb423eff2"
+    },
+    {
+      "path": "SECURITY.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "cab10e1112e3992603cc939c66cb269e5c56f426",
+      "size": 1440,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/cab10e1112e3992603cc939c66cb269e5c56f426"
+    },
+    {
+      "path": "icons",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "e36ab0690e44c1fad69207ab4c4115737927d838",
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/trees/e36ab0690e44c1fad69207ab4c4115737927d838"
+    },
+    {
+      "path": "icons/icon128.png",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b00fa65452ef1fae1fd430757032c0dbd1f06809",
+      "size": 624,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/b00fa65452ef1fae1fd430757032c0dbd1f06809"
+    },
+    {
+      "path": "icons/icon16.png",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "d68cbefa9c9b2e4f646f0fbdcae33721799eca8e",
+      "size": 158,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/d68cbefa9c9b2e4f646f0fbdcae33721799eca8e"
+    },
+    {
+      "path": "icons/icon48.png",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "0f4ee0867eb593ac59800c0cd90195ecfd3fb804",
+      "size": 275,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/0f4ee0867eb593ac59800c0cd90195ecfd3fb804"
+    },
+    {
+      "path": "lib",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "550965b43256cd8561211db8551ba63d4868e4c0",
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/trees/550965b43256cd8561211db8551ba63d4868e4c0"
+    },
+    {
+      "path": "lib/xlsx.full.min.js",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "21471af69ef0e4cda1613c2702c54101b92f48d2",
+      "size": 951904,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/21471af69ef0e4cda1613c2702c54101b92f48d2"
+    },
+    {
+      "path": "manifest.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "c77a9d2901b8151721e2cd0044d8d6e7a9369360",
+      "size": 820,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/c77a9d2901b8151721e2cd0044d8d6e7a9369360"
+    },
+    {
+      "path": "src",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "cca8c9f635a08a65c79c8437440f19891ee38881",
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/trees/cca8c9f635a08a65c79c8437440f19891ee38881"
+    },
+    {
+      "path": "src/background.js",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b5995382bb20adbd383bed488eac54b173710708",
+      "size": 2241,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/b5995382bb20adbd383bed488eac54b173710708"
+    },
+    {
+      "path": "src/content.js",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "a539c72c70fb1e0cc5bc4c4aecf5f9729c2ea1ed",
+      "size": 30253,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/a539c72c70fb1e0cc5bc4c4aecf5f9729c2ea1ed"
+    },
+    {
+      "path": "src/dashboard.css",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "60f68b201a234b82a080f6e06bfdad6267ffeb4f",
+      "size": 5748,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/60f68b201a234b82a080f6e06bfdad6267ffeb4f"
+    },
+    {
+      "path": "src/dashboard.html",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "7fd4d512c41cd0a5f323b633c512ed765afa7e14",
+      "size": 3542,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/7fd4d512c41cd0a5f323b633c512ed765afa7e14"
+    },
+    {
+      "path": "src/dashboard.js",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "1cf17457333dd059ee68efdd1cfde9c29a9723fe",
+      "size": 13152,
+      "url": "https://api.github.com/repos/iblead/open-data-scraper/git/blobs/1cf17457333dd059ee68efdd1cfde9c29a9723fe"
+    }
+  ],
+  "truncated": false
+}

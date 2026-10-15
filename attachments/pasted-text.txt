@@ -1,0 +1,2356 @@
+// ==UserScript==
+// @name         Harvest — Universal Listing + Price Scraper
+// @namespace    harvest.universal
+// @version      5.3.2
+// @description  Auto-detects store type on ANY site. Unknown sites: compiles a site-specific extractor with anti-hijack protection plus a self-calibrating learned sold-out model. Crash-hardened: a failing stage falls through instead of killing the panel. Debug via window.__harvest. Panel appears when listings are detected, or press Ctrl+Alt+H.
+// @match        *://*/*
+// @noframes
+// @exclude      *://*.google.com/*
+// @exclude      *://*.google.tld/*
+// @exclude      *://*.youtube.com/*
+// @exclude      *://*.facebook.com/*
+// @exclude      *://*.instagram.com/*
+// @exclude      *://*.twitter.com/*
+// @exclude      *://x.com/*
+// @exclude      *://*.github.com/*
+// @exclude      *://*.grok.com/*
+// @exclude      *://mail.google.com/*
+// @exclude      *://cardservices.myprepaidcenter.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+(function () {
+  'use strict';
+
+  /* ============================ CONSTANTS ============================ */
+  const STATE_KEY = 'harvestScraperState_v5';
+  const BLUEPRINT_KEY = 'harvestBlueprint_v5';
+  const OOS_MODEL_KEY = 'harvestOosModel_v2';
+  const PAGE_LOAD_WAIT_MS = 2800;
+  const SCRAPE_SETTLE_MS = 900;
+  const host = location.hostname.toLowerCase();
+  const SKIP_TITLES = /^(add to cart|add to bag|buy now|quick view|sale|sold out|out of stock|new|view|view more|shop now|learn more|see details|choose options|select options|wishlist|compare|next|previous|load more|عرض المزيد|المزيد)$/i;
+
+  /* [v5.3.1] expanded Egyptian-pound variants + regional Arabic currencies */
+  const CURRENCY = '(?:(?<![A-Za-z\\u0600-\\u06FF])(?:'
+    /* --- Latin codes --- */
+    + 'EGP|USD|SAR|AED|EUR|GBP|CAD|AUD|QAR|KWD|BHD|OMR|TRY|INR|LE|L\\.E\\.?|'
+    /* --- Arabic pound: full-word forms (longest first) --- */
+    + 'جنيهات|جنيهين|جنيهًا|جنيهآ|جنيها|جنيةات|جنيات|جنيةًا|جنيةآ|جنيه|جنية|'
+    /* --- Arabic pound: with country qualifier --- */
+    + 'جنيه\\s*مصري|جنيه\\s*مصرى|جنيه\\s*مصريًا|جنية\\s*مصري|جنية\\s*مصرى|'
+    /* --- Arabic pound: abbreviations --- */
+    + 'ج\\.م\\.|ج\\.م|ج\\s*م|جم|'
+    /* --- Piastre / qirsh (subunit) --- */
+    + 'قروش|قرش|'
+    /* --- Other regional Arabic currencies --- */
+    + 'ريال|درهم|دينار'
+    + ')(?![A-Za-z\\u0600-\\u06FF])'
+    /* --- non-Arabic-script currency symbols --- */
+    + '|E£|£E|US\\$|\\$|€|£|¥|₹|'
+    /* --- Arabic currency symbols --- */
+    + 'د\\.إ|ر\\.س|ج\\.م)';
+  const NUMBER = '(?:\\d{1,3}(?:[,\\s]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)';
+  const PRICE_RE = new RegExp('(?:' + CURRENCY + '\\s*' + NUMBER + '|' + NUMBER + '\\s*' + CURRENCY + '|' + NUMBER + '\\s*(?:EGP|SAR|AED|USD)+)', 'i');
+  const PRICE_G_RE = new RegExp(PRICE_RE.source, 'gi');
+  const UTIL_CLASS_RE = /^(col|row|grid|flex|w-|h-|p-|m-|px-|py-|pt-|pb-|pl-|pr-|mx-|my-|mt-|mb-|text-|bg-|sm:|md:|lg:|xl:|absolute|relative|block|hidden|rounded|shadow|border|gap-|items-|justify-|overflow|container|wrapper|inner|outer)/i;
+  const PRICE_HINT = '[class*="price" i], [class*="amount" i], [class*="money" i], [itemprop="price"], [data-price], [data-price-amount]';
+  const TITLE_SELS = ['[itemprop="name"]', 'h2 a', 'h3 a', 'h4 a', 'h2', 'h3', 'h4', '.product-title a', '.name a', 'a[href]'];
+
+  /* [v5.3] additions from v5.1 */
+  const PRODUCT_HREF = /\/(products?|shop|p|pd|item|smartphones?|mobile|phones?)(\/|$)/i;
+  /* [v5.3.1] include Arabic currency words in dup-stripper */
+  const DUP_CURRENCY = /(EGP|USD|SAR|AED|EUR|GBP|CAD|AUD|QAR|KWD|BHD|OMR|TRY|INR|LE|جنيه|جنية)\1/gi;
+  const BARE_MORE = /^(?:more|المزيد)$/i;
+
+  /* ---------- ANTI-HIJACK: recommendation / upsell / filter zones are ignored ---------- */
+  const HIJACK_RE = /recommend|upsell|up-?sell|related|recently|cross-?sell|also[-_ ]?like|you[-_ ]?may|complementary|wishlist/i;
+  const HIJACK_SEL = '[class*="recommend" i],[id*="recommend" i],[class*="upsell" i],[class*="up-sell" i],[class*="related" i],[id*="related" i],[class*="recently" i],[class*="cross-sell" i],[class*="crosssell" i],[class*="also-like" i],[class*="you-may" i],[class*="wishlist" i],[data-recommendations]';
+
+  function inHijackZone(el) {
+    if (!el || !el.closest) return false;
+    try {
+      const m = el.closest(HIJACK_SEL);
+      if (!m || m === document.body || m === document.documentElement) return false;
+      return true;
+    } catch (e) { return false; }
+  }
+  function inBoilerplate(el) {
+    if (!el || !el.closest) return false;
+    try { return !!el.closest('nav, footer, [role="navigation"], [aria-hidden="true"]'); } catch (e) { return false; }
+  }
+  function inFilterZone(el) {
+    if (!el || !el.closest) return false;
+    try { return !!el.closest('aside, [class*="filter" i], [id*="filter" i], [class*="facet" i], [class*="sidebar" i], [id*="sidebar" i]'); } catch (e) { return false; }
+  }
+  /* [v5.3] from v5.1: skip header/nav chrome */
+  function inChrome(el) {
+    if (!el || !el.closest) return false;
+    try { return !!el.closest('header, nav, footer, [role="navigation"], .site-header, #header, .main-nav'); } catch (e) { return false; }
+  }
+  /* [v5.3] from v5.1: visible check */
+  function isVisible(el) {
+    if (!el) return false;
+    if (el.hidden) return false;
+    const style = (el.getAttribute && el.getAttribute('style')) || '';
+    if (/display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style)) return false;
+    if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+    try { if (el.getClientRects && el.getClientRects().length === 0) return false; } catch (e) { /* ignore */ }
+    return true;
+  }
+  function isInsideCard(el) {
+    if (!el || !el.closest) return false;
+    const bp = loadBlueprint();
+    if (bp && bp.selectors && bp.selectors.card) {
+      try { if (el.closest(bp.selectors.card)) return true; } catch (e) { /* ignore */ }
+    }
+    try {
+      return !!el.closest('article, [data-product-id], [data-asin], [data-qa*="product-box"], .product-card, .product-item, .yalla-product-card, .nf-product-card, li.product, div.product-thumb');
+    } catch (e) { return false; }
+  }
+
+  /* ---------- CRASH HARDENING ---------- */
+  let LAST_ERROR = null;
+  function recordError(label, err) {
+    LAST_ERROR = {
+      label: label,
+      name: (err && err.name) || 'Error',
+      message: String((err && err.message) || err),
+      stack: String((err && err.stack) || '')
+    };
+  }
+  function safeCall(fn, label) {
+    try {
+      return fn();
+    } catch (err) {
+      recordError(label, err);
+      console.error('[Harvest] ' + label + ' crashed:', err);
+      return null;
+    }
+  }
+
+  /* ============================ OOS MODEL ============================ */
+  let OOS_CACHE = new WeakMap();
+  let INCLUDE_OOS = false;
+
+  const KEY = (s) => String(s == null ? '' : s).toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u064b-\u0652\u0640]/g, '')
+    .replace(/[^0-9a-z\u00c0-\uffff]+/g, '');
+
+  const OOS_WORDS = [
+    'outofstock', 'soldout', 'unavailable', 'notavailable', 'nonavailable', 'nolongeravailable',
+    'nolongerinstock', 'notinstock', 'nostock', 'noavailability', 'stockout',
+    'outofinventory', 'noinventory', 'zerostock', 'stockzero', 'emptystock', 'discontinued',
+    'delisted', 'waitlist', 'waitinglist', 'joinwaitlist', 'notifyme', 'notifywhenavailable',
+    'emailmewhen', 'bethefirsttoknow', 'restock', 'restocknotify', 'backinstock', 'comingbacksoon',
+    'itemunavailable', 'productunavailable', 'temporarilyunavailable', 'currentlyunavailable',
+    'temporarilyoutofstock', 'nosuchitem', 'stockstatusout', 'availabilityoutofstock',
+    'agotado', 'agotada', 'agotados', 'sinexistencias', 'sinstock', 'nodisponible',
+    'nodisponibleactualmente', 'esgotado', 'esgotada', 'semestoque', 'indisponivel',
+    'produtoindisponivel', 'acabou', 'vendido', 'epuise', 'rupturestock', 'enrupturestock',
+    'indisponible', 'nondisponible', 'plusdisponible', 'vendu', 'esaurito', 'esaurita',
+    'prodottoesaurito', 'nondisponibile',
+    'ausverkauft', 'nichtauflager', 'nichtverfugbar', 'vergriffen',
+    'uitverkocht', 'nietbeschikbaar', 'nietopvoorraad', 'tijdelijknietleverbaar',
+    'voorraadop', 'nietleverbaar', 'geenvoorraad', 'utmarkt', 'utsolgt', 'ikkelager',
+    'ikkeilager', 'ikkeopvlager', 'ikketilgjengelig', 'slutilager', 'solgtut', 'udsolgt',
+    'loppunut', 'eivarastossa', 'eisaatavilla', 'myytyloppuun',
+    'brakwm', 'brakwmagazynie', 'niedostepne', 'niedostepnosc', 'niedostepny', 'wyczerpany',
+    'wyczerpane', 'sprzedany', 'sprzedane', 'nedostupne', 'nedostupny', 'vyprodano',
+    'neniskladem', 'elfogyott', 'nincsraktaron', 'epuizat', 'nuesteinstoc', 'vandut',
+    'izcherpan', 'nyamavnalichie', 'tuckend', 'stoktayok', 'tukenmis', 'mevcutdegil',
+    'bulunmuyor', 'satildi',
+    'нетвналичии', 'закончился', 'закончилось', 'закончилась', 'невналичии', 'нетвпродаже',
+    'продано', 'товарзакончился', 'немаєвнаявності', 'закінчився', 'закінчилось',
+    'εξαντλήθηκε', 'μηδιαθέσιμο',
+    'غيرمتوفر', 'غيرمتاح', 'نفذ', 'نفد', 'نفدت', 'انتهت', 'مباع', 'مكتمل', 'مخلص', 'موجودنیست',
+    'ناموجود', 'بهاتمامرسید', 'אזל', 'איןבמלאי', 'לאזמין',
+    'stokhabis', 'tidaktersedia', 'terjualhabis', 'habisterjual', 'habis',
+    'สินค้าหมด', 'หมดสต็อก', 'หมดสต๊อก', 'ไม่มีสินค้า', 'ของหมด', 'hethang', 'tamhethang',
+    'khongconhang', 'hetstock', '売り切れ', '在庫切れ', '品切れ', '품절', '재고없음', '판매완료',
+    '售罄', '缺货', '已售完', '无货', '无库存', '已下架', '补货中', '暂时缺货'
+  ];
+  const OOS_RE = new RegExp(OOS_WORDS.map(KEY).join('|'), 'i');
+  const OOS_TOKENS = new Set(['oos', 'out', 'oof', 'gone', 'ended', 'expired', 'sold', 'unavail', 'nestock', 'noavail', 'deadstock', 'lastone']);
+  const STOCK_WORDS = ['instock', 'available', 'purchasable', 'orderable', 'backorder', 'preorder',
+    'addtocart', 'onlyleft', 'lowstock', 'lastunits', 'limitedavailability', 'sisaatila', 'sisaeissa',
+    'sisaamat', 'dostepne', 'dostepny', 'wmagazynie'];
+  const STOCK_RE = new RegExp(STOCK_WORDS.join('|'), 'i');
+  const STOCK_TOKENS = new Set(['instock', 'available', 'avail', 'orderable']);
+  const HARD_INSTOCK_TOKEN = /^(instock|in-stock|in_stock|available|orderable|backorder|preorder)$/;
+  const HARD_OOS_TOKEN     = /^(outofstock|out-of-stock|out_of_stock|soldout|sold-out|unavailable|discontinued)$/;
+  const NAME_OOS = /(sold|outofstock|oos|nostock|discontinued|waitlist|notify|restock|unavailable)/;
+  const NAME_AVAIL = /(stock|avail|inventory|purchas|orderabl|qty|quantity|quantit|remaining|instock)/;
+  const NEGVAL = /^(false|0|no|none|off|null|undefined)$/;
+  const POSVAL = /^(true|1|yes|on|enabled)$/;
+  const BUY_RE = /(addtocart|addtobag|buynow|buyitnow|buy|shop|ordernow|purchase|checkout|placeorder|اطلب|اضف|السلة|حجز|اشتري|شراء)/;
+
+  /* ============================ DEEP JSON ATTRIBUTE PARSER ============================ */
+  const AVAIL_KEYS = /^(available|availability|is_?available|in_?stock|instock|purchasable|orderable|can_?add|buyable)$/i;
+  const STOCK_QTY_KEYS = /^(inventory_?quantity|stock_?quantity|stock)$/i;
+
+  function evaluateLeaf(v) {
+    if (typeof v === 'string') {
+      v = v.toLowerCase();
+      const slash = v.lastIndexOf('/');
+      if (slash !== -1) v = v.slice(slash + 1);
+    }
+    if (v === false || v === 0 || v === '0' || v === 'false' || v === 'outofstock' || v === 'out_of_stock') {
+      return true;
+    }
+    if (v === true || v === 'true' || v === 'instock' || v === 'in_stock' || (typeof v === 'number' && v > 0)) {
+      return false;
+    }
+    return null;
+  }
+
+  function findAvailFlag(node, depth) {
+    if (depth === undefined) depth = 0;
+    if (depth > 3 || node == null || typeof node !== 'object') return null;
+
+    if (Array.isArray(node)) {
+      let sawValidSignal = false;
+      for (let i = 0; i < node.length; i++) {
+        const res = findAvailFlag(node[i], depth + 1);
+        if (res === false) return false;
+        if (res === true) sawValidSignal = true;
+      }
+      return sawValidSignal ? true : null;
+    }
+
+    for (const k in node) {
+      if (AVAIL_KEYS.test(k)) {
+        const res = evaluateLeaf(node[k]);
+        if (res !== null) return res;
+      }
+      if (STOCK_QTY_KEYS.test(k) && typeof node[k] === 'number') {
+        return node[k] <= 0;
+      }
+    }
+
+    if (node.variants && Array.isArray(node.variants)) {
+      const res = findAvailFlag(node.variants, depth + 1);
+      if (res !== null) return res;
+    }
+
+    for (const k in node) {
+      if (k === 'variants') continue;
+      const res = findAvailFlag(node[k], depth + 1);
+      if (res !== null) return res;
+    }
+
+    return null;
+  }
+
+  function jsonAttrOOS(el) {
+    if (!el || !el.attributes) return null;
+    for (let i = 0; i < el.attributes.length; i++) {
+      const v = (el.attributes[i].value || '').trim();
+      if (v[0] !== '{' && v[0] !== '[') continue;
+      try {
+        const obj = JSON.parse(v);
+        const res = findAvailFlag(obj, 0);
+        if (res !== null) return res;
+      } catch (e) { /* ignore */ }
+    }
+    return null;
+  }
+
+  function searchJsonState(card) {
+    if (!card || card.nodeType !== 1) return null;
+    let res = jsonAttrOOS(card);
+    if (res !== null) return res;
+    let p = card.parentElement;
+    for (let i = 0; i < 3; i++) {
+      if (!p || p === document.body) break;
+      res = jsonAttrOOS(p);
+      if (res !== null) return res;
+      p = p.parentElement;
+    }
+    const children = card.children;
+    for (let i = 0; i < children.length; i++) {
+      res = jsonAttrOOS(children[i]);
+      if (res !== null) return res;
+    }
+    return null;
+  }
+
+  function isDisabledEl(el) {
+    if (!el) return false;
+    if (el.disabled) return true;
+    const ad = el.getAttribute && el.getAttribute('aria-disabled');
+    if (ad === 'true' || ad === 'disabled') return true;
+    if (el.getAttribute && el.getAttribute('data-disabled') === 'true') return true;
+    const cls = (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '');
+    if (/(^|[\s_-])(disabled|is-disabled|aria-disabled)([\s_-]|$)/i.test(cls)) return true;
+    try { if (el.matches && el.matches('[disabled],[aria-disabled="true"]')) return true; } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  function priceCount(el) {
+    const t = textOf(el);
+    if (!t) return 0;
+    const m = t.match(PRICE_G_RE);
+    return m ? m.length : 0;
+  }
+
+  function structuralCard(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (!el.querySelector('a[href]')) return false;
+    return !!(el.querySelector('img') || el.querySelector('h1,h2,h3,h4'));
+  }
+
+  /* [v5.3] from v5.1: skip composite rows containing >1 distinct product */
+  function isCompositeCard(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const kids = Array.from(el.children || []);
+    const structs = kids.filter(structuralCard);
+    if (structs.length >= 2) return true;
+    const hrefs = new Set();
+    qsAll(el, 'a[href]').forEach((a) => {
+      const h = a.getAttribute('href') || '';
+      if (PRODUCT_HREF.test(h)) {
+        try { hrefs.add(new URL(h, location.href).pathname.replace(/\/$/, '')); }
+        catch (e) { hrefs.add((h.split('?')[0] || h)); }
+      }
+    });
+    return hrefs.size >= 2 && structs.length >= 2;
+  }
+
+  function oosRegion(card) {
+    let node = card;
+    for (let i = 0; i < 4; i++) {
+      const p = node.parentElement;
+      if (!p || p === document.body || p === document.documentElement) break;
+      if (p.children.length > 8) break;
+      let foreign = false;
+      for (let j = 0; j < p.children.length; j++) {
+        const ch = p.children[j];
+        if (ch === node || node.contains(ch)) continue;
+        if (structuralCard(ch)) { foreign = true; break; }
+      }
+      if (foreign) break;
+      if (priceCount(p) > 2) break;
+      node = p;
+    }
+    return node;
+  }
+
+  function classifyAttrs(el, isTitle) {
+    let oos = 0, instock = 0, why = '';
+    const attrs = el.attributes;
+    if (!attrs) return { oos: 0, instock: 0, why: '' };
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      const n = String(a.name || '').toLowerCase();
+      const v = String(a.value || '');
+      const raw = v.trim();
+      const kv = KEY(v);
+
+      /* [v5.3.2] explicit inventory-status attributes get hard signal */
+      if (n === 'data-inventory-status' || n === 'data-stock-status') {
+        if (/^(instock|lowstock|limitedstock|available|preorder|backorder)$/.test(kv)) { instock = Math.max(instock, 4); continue; }
+        if (/^(outofstock|soldout|unavailable|nostock)$/.test(kv)) { oos = Math.max(oos, 4); why = why || '@' + a.name; continue; }
+      }
+
+      if (n === 'class' || n === 'id') {
+        const tokens = raw.toLowerCase().split(/\s+/);
+        for (let t = 0; t < tokens.length; t++) {
+          const tok = tokens[t];
+          if (!tok) continue;
+          if (HARD_INSTOCK_TOKEN.test(tok)) {
+            if (instock < 4) instock = 4;
+            continue;
+          }
+          if (HARD_OOS_TOKEN.test(tok)) {
+            if (oos < 4) { oos = 4; if (!why) why = n + '="' + tok + '"'; }
+            continue;
+          }
+          const k = KEY(tok);
+          if (!k) continue;
+          if (OOS_TOKENS.has(k)) {
+            if (oos < 3) { oos = 3; if (!why) why = n + '="' + tok + '"'; }
+          } else if (STOCK_TOKENS.has(k)) {
+            if (instock < 3) instock = 3;
+          } else if (OOS_RE.test(k)) {
+            if (oos < 3) { oos = 3; if (!why) why = n + '="' + tok + '"'; }
+          } else if (STOCK_RE.test(k)) {
+            if (instock < 2) instock = 2;
+          }
+        }
+        continue;
+      }
+      if (n === 'style') {
+        if (/grayscale\s*\(\s*(0?\.[5-9]|1)/i.test(v) || /opacity\s*:\s*0?\.[0-8]\b/i.test(v)) { if (!oos) { oos = 1; why = 'inline style'; } }
+        continue;
+      }
+      if (n === 'href' || n === 'action') {
+        if (/schema\.org/i.test(v)) {
+          if (/schema\.org\/?InStock/i.test(v)) { instock = Math.max(instock, 4); continue; }
+          if (OOS_RE.test(kv) || OOS_TOKENS.has(kv)) {
+            if (el.getClientRects && el.getClientRects().length) { oos = 3; why = 'schema.org link'; }
+          }
+        }
+        continue;
+      }
+      if (isTitle && (n === 'alt' || n === 'title' || n === 'aria-label')) continue;
+      if (n === 'src' || n === 'srcset' || n === 'data-src' || n === 'data-srcset' ||
+          n === 'data-original' || n === 'data-lazy-src' || n === 'poster') {
+        if (OOS_RE.test(kv) || OOS_TOKENS.has(kv)) { if (!oos) { oos = 1; why = 'image filename'; } }
+        continue;
+      }
+      const rl = raw.toLowerCase();
+      if (/^data-(is-)?(sold-?out|out-?of-?stock|oos|unavailable)$/.test(n) && POSVAL.test(rl)) { oos = Math.max(oos, 3); why = why || '@' + a.name; continue; }
+      if (/^data-(is-)?(available|in-?stock|stock|inventory(-?quantity)?)$/.test(n) && /^(0|false|no)$/.test(rl)) { oos = Math.max(oos, 3); why = why || '@' + a.name; continue; }
+      if (NEGVAL.test(raw)) continue;
+      if (n === 'alt' || n === 'title' || n === 'aria-label') {
+        if (OOS_RE.test(kv) || OOS_TOKENS.has(kv)) { if (!oos) { oos = raw.length <= 24 ? 3 : 1; why = '@' + a.name; } }
+        continue;
+      }
+      if (OOS_RE.test(kv) || OOS_TOKENS.has(kv)) {
+        if (NAME_OOS.test(n) && POSVAL.test(raw)) { oos = Math.max(oos, 3); why = why || '@' + a.name; }
+        else if (NAME_OOS.test(n) && !POSVAL.test(raw) && kv.length <= 10) { /* ambiguous */ }
+        else { oos = Math.max(oos, 3); why = why || '@' + a.name; }
+        continue;
+      }
+      if (NAME_AVAIL.test(n) && (kv === '0' || kv === 'false' || kv === 'no')) { oos = Math.max(oos, 3); why = why || '@' + a.name + '=0'; continue; }
+      if (NAME_AVAIL.test(n) && (POSVAL.test(raw) || kv === '1' || kv === 'true')) { instock = Math.max(instock, 3); continue; }
+      if (n.indexOf('data-') === 0 || n.indexOf('aria-') === 0 || n === 'itemprop' || n === 'content' ||
+          n === 'value' || n === 'placeholder' || n === 'name' || n === 'role') {
+        if (STOCK_RE.test(kv) || STOCK_TOKENS.has(kv)) instock = Math.max(instock, 2);
+      }
+    }
+    return { oos: oos, instock: instock, why: why };
+  }
+
+  function scanTextBadges(card, titleEl) {
+    const els = card.querySelectorAll('span,div,p,b,strong,em,i,small,label,button,a,output,li,dd,dt,h4,h5,h6,figcaption,caption,td');
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      if (titleEl && (el === titleEl || el.contains(titleEl))) continue;
+      if (el.children.length > 4) continue;
+      if (typeof el.getClientRects === 'function' && !el.getClientRects().length) continue;
+      const t = textOf(el);
+      if (!t || t.length > 60) continue;
+      if (el.querySelector('a[href], h1, h2, h3, h4, h5, img, [class*="price" i]')) continue;
+      const k = KEY(t).replace(/منفذ|منافذ/g, '');
+      if (!k || k.length > 46) continue;
+      if (OOS_TOKENS.has(k) || OOS_RE.test(k)) return t.slice(0, 40);
+    }
+    return '';
+  }
+
+  function scanBuy(card) {
+    const out = { present: false, count: 0, on: 0, off: 0, oosLabel: false };
+    const els = card.querySelectorAll('a,button,[role="button"],input[type="submit"]');
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      const label = KEY([el.getAttribute('aria-label') || '', el.getAttribute('title') || '',
+        el.getAttribute('data-action') || '', (typeof el.className === 'string' ? el.className : ''),
+        el.getAttribute('value') || '', textOf(el)].join(' '));
+      if (!label) continue;
+      const oosHit = OOS_RE.test(label) || OOS_TOKENS.has(label);
+      const isBuy = BUY_RE.test(label);
+      if (oosHit) { out.oosLabel = true; continue; }
+      if (!isBuy) continue;
+      out.present = true; out.count++;
+      if (isDisabledEl(el)) out.off++; else out.on++;
+    }
+    return out;
+  }
+
+  function computeEvidence(card, titleEl) {
+    const ev = { score: 0, hardOos: false, hardInStock: false, why: [], tokens: [], feats: {} };
+    if (!card || card.nodeType !== 1) return ev;
+
+    const jsonSignal = searchJsonState(card);
+    if (jsonSignal === true) {
+      ev.score += 5;
+      ev.hardOos = true;
+      ev.why.push('json attribute state (available: false)');
+      return ev;
+    } else if (jsonSignal === false) {
+      ev.hardInStock = true;
+      return ev;
+    }
+
+    const region = oosRegion(card);
+    const els = []; const seen = new Set();
+    function add(el) { if (el && el.nodeType === 1 && !seen.has(el)) { seen.add(el); els.push(el); } }
+    add(region); add(card);
+    const all = card.querySelectorAll('*');
+    for (let i = 0; i < all.length && els.length < 240; i++) add(all[i]);
+    if (region !== card) { const rc = region.children; for (let i = 0; i < rc.length; i++) add(rc[i]); }
+    const toks = new Set();
+    for (let i = 0; i < els.length; i++) {
+      const cls = (typeof els[i].className === 'string' ? els[i].className : (els[i].getAttribute && els[i].getAttribute('class')) || '');
+      const parts = String(cls).split(/\s+/);
+      for (let j = 0; j < parts.length; j++) if (parts[j] && parts[j].length < 40) toks.add(parts[j]);
+    }
+    ev.tokens = Array.from(toks);
+    /* [v5.3.2] hidden templates should not contribute hard OOS signals */
+    let cardRendered = false;
+    try { cardRendered = card.getClientRects().length > 0; } catch (e) { /* ignore */ }
+    function isRendered(el) {
+      try { return el.getClientRects().length > 0 || getComputedStyle(el).display === 'contents'; }
+      catch (e) { return true; }
+    }
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      const r = classifyAttrs(el, !!(titleEl && el === titleEl));
+      if (r.oos && cardRendered && !isRendered(el)) { r.oos = 0; r.why = ''; }
+      if (r.oos) {
+        ev.score += r.oos;
+        if (r.oos >= 3) ev.hardOos = true;
+        if (r.why && ev.why.length < 6) ev.why.push(r.why);
+      }
+      if (r.instock >= 3) ev.hardInStock = true;
+      else if (r.instock === 2) ev.score -= 1;
+    }
+    const badge = scanTextBadges(card, titleEl);
+    if (badge) { ev.score += 3; ev.hardOos = true; ev.why.push('badge "' + badge + '"'); }
+    const buys = scanBuy(card);
+    if (buys.oosLabel) { ev.score += 3; ev.hardOos = true; ev.why.push('add-to-cart says sold out'); }
+    ev.feats.buyPresent = buys.present;
+    ev.feats.buyCount = buys.count;
+    ev.feats.buyOn = buys.on;
+    ev.feats.buyAllDisabled = buys.present && !buys.oosLabel && buys.count > 0 && buys.on === 0;
+    try {
+      if (card.querySelector('input[name*="notify" i], input[name*="waitlist" i], input[name*="backorder" i], input[placeholder*="notify" i], form[action*="notify" i], [class*="waitlist" i]')) {
+        ev.score += 3; ev.hardOos = true; ev.why.push('notify/waitlist widget');
+      }
+    } catch (e) { /* ignore */ }
+    const f = ev.feats;
+    try {
+      const cs = getComputedStyle(card);
+      f.opacity = parseFloat(cs.opacity);
+      if (!isFinite(f.opacity)) f.opacity = 1;
+      if (/grayscale\s*\(\s*(0?\.[5-9]|1)/i.test(cs.filter || cs.webkitFilter || '')) f.gray = true;
+    } catch (e) { f.opacity = 1; }
+    f.strike = !!qs(card, 's, del, [class*="strike" i], [class*="linethrough" i]');
+    const pes = qsAll(card, PRICE_HINT).slice(0, 3);
+    for (let i = 0; i < pes.length; i++) {
+      try { if (/line-through/.test(getComputedStyle(pes[i]).textDecorationLine || '')) { f.strike = true; break; } } catch (e) { /* ignore */ }
+    }
+    f.hasPrice = PRICE_RE.test(textOf(card));
+    return ev;
+  }
+
+  function evidenceFor(card, titleEl) {
+    let e = OOS_CACHE.get(card);
+    if (!e) { e = computeEvidence(card, titleEl); OOS_CACHE.set(card, e); }
+    return e;
+  }
+
+  function bumpOos(card, titleEl, delta, why) {
+    const e = evidenceFor(card, titleEl);
+    e.score += delta;
+    if (delta >= 3) e.hardOos = true;
+    if (why && e.why.length < 6) e.why.push(why);
+    return e;
+  }
+
+  function soldOutIn(card, titleEl) {
+    try {
+      const e = evidenceFor(card, titleEl);
+      if (e.hardInStock) return false;
+      return e.hardOos || e.score >= 2;
+    } catch (err) {
+      recordError('soldOutIn', err);
+      console.error('[Harvest] OOS evidence crashed on card:', err, card);
+      return false;
+    }
+  }
+
+  function modelHit(m, tokens) {
+    if (!m || !tokens || !tokens.length) return 0;
+    for (let i = 0; i < tokens.length; i++) if (m.rules.indexOf(tokens[i]) !== -1) return 1;
+    for (let i = 0; i < tokens.length; i++) if (m.neg.indexOf(tokens[i]) !== -1) return -1;
+    return 0;
+  }
+
+  function learnModel(dom, prev) {
+    const conf = [], ok = [];
+    for (let i = 0; i < dom.length; i++) {
+      const ev = dom[i].ev;
+      if (ev.hardOos && !ev.hardInStock) conf.push(ev);
+      else if (!ev.hardInStock && ev.score <= 1 && ev.feats.hasPrice) ok.push(ev);
+    }
+    if (conf.length < 2 || ok.length < 3) return prev || null;
+    const total = dom.length;
+    const freq = new Map(), oos = new Map(), ost = new Map();
+    dom.forEach(x => x.ev.tokens.forEach(t => freq.set(t, (freq.get(t) || 0) + 1)));
+    conf.forEach(ev => ev.tokens.forEach(t => oos.set(t, (oos.get(t) || 0) + 1)));
+    ok.forEach(ev => ev.tokens.forEach(t => ost.set(t, (ost.get(t) || 0) + 1)));
+    const rules = [], neg = [];
+    oos.forEach((n, t) => {
+      const oRate = n / conf.length;
+      const iRate = (ost.get(t) || 0) / ok.length;
+      if (oRate >= 0.6 && iRate <= 0.15 && (freq.get(t) || 0) <= total * 0.4) rules.push(t);
+    });
+    ost.forEach((n, t) => {
+      const iRate = n / ok.length;
+      if (iRate >= 0.6 && !oos.has(t) && (freq.get(t) || 0) <= total * 0.6) neg.push(t);
+    });
+    if (prev && prev.rules) {
+      prev.rules.forEach(t => { if (rules.indexOf(t) === -1) rules.push(t); });
+      prev.neg.forEach(t => { if (neg.indexOf(t) === -1) neg.push(t); });
+    }
+    const model = { host: host, rules: rules, neg: neg, learned: conf.length, clean: ok.length, total: total, at: Date.now() };
+    if (rules.length) {
+      let hit = 0;
+      dom.forEach(x => { if (modelHit(model, x.ev.tokens) > 0) hit++; });
+      console.log('[Harvest] sold-out model: ' + rules.length + ' rule(s) from ' +
+        conf.length + ' sold-out / ' + ok.length + ' in-stock samples, covers ' + hit + '/' + total + ' cards',
+        rules.slice(0, 12));
+    }
+    return model;
+  }
+
+  function loadOosModel() {
+    try {
+      const m = JSON.parse(sessionStorage.getItem(OOS_MODEL_KEY) || 'null');
+      if (m && m.host === host && m.rules && m.rules.length) return m;
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function saveOosModel(m) {
+    try {
+      if (m) sessionStorage.setItem(OOS_MODEL_KEY, JSON.stringify(m));
+      else sessionStorage.removeItem(OOS_MODEL_KEY);
+    } catch (e) { /* ignore */ }
+  }
+
+  function pageStats(dom) {
+    const s = { n: dom.length, ops: [], strike: 0, okCount: 0, strikeOk: 0, price: 0, buyTotal: 0, buyEnabled: 0 };
+    dom.forEach(x => {
+      const f = x.ev.feats;
+      if (isFinite(f.opacity)) s.ops.push(f.opacity);
+      if (f.strike) s.strike++;
+      if (f.hasPrice) s.price++;
+      if (!x.ev.hardOos) {
+        s.okCount++;
+        if (f.strike) s.strikeOk++;
+        if (f.buyPresent) { s.buyTotal++; if (f.buyOn > 0) s.buyEnabled++; }
+      }
+    });
+    s.ops.sort((a, b) => a - b);
+    s.medOpacity = s.ops.length ? s.ops[Math.floor(s.ops.length / 2)] : 1;
+    s.strikeOkRate = s.okCount ? s.strikeOk / s.okCount : 0;
+    s.priceRate = s.n ? s.price / s.n : 0;
+    s.buyEnabledRate = s.buyTotal ? s.buyEnabled / s.buyTotal : 0;
+    return s;
+  }
+
+  function relativeScore(ev, s) {
+    if (!ev || !s || s.n < 5) return 0;
+    let add = 0;
+    if (s.medOpacity >= 0.95 && ev.feats.opacity <= 0.75) add += 1;
+    if (s.strikeOkRate <= 0.25 && ev.feats.strike && !ev.feats.buyPresent) add += 1;
+    if (s.buyTotal >= 3 && s.buyEnabledRate >= 0.5 && ev.feats.buyPresent && ev.feats.buyAllDisabled) add += 2;
+    if (s.priceRate >= 0.75 && !ev.feats.hasPrice) add += 1;
+    return add;
+  }
+
+  function ldTitleMap(ld) {
+    const m = new Map();
+    (ld || []).forEach(l => { if (l && l.oos) { const k = KEY(l.title); if (k.length > 6) m.set(k, true); } });
+    return m.size ? m : null;
+  }
+
+  function decideOos(x, model, rel) {
+    const ev = x.ev;
+    if (!ev) return !!x.oos;
+    if (ev.hardInStock) return false;
+    if (ev.hardOos) return true;
+    let score = ev.score + (rel || 0);
+    const mh = modelHit(model, ev.tokens);
+    if (mh > 0) score += 2; else if (mh < 0) score -= 1;
+    return score >= 2;
+  }
+
+  function finalizePage(items, model, ld) {
+    const raw = (items || []).map(it => ({
+      title: it.title, price: it.price, oos: !!it.oos, url: it.url || '',
+      rating: it.rating || '', reviews: it.reviews || '',
+      card: it.card || null, titleEl: it.titleEl || null,
+      ev: it.card ? safeCall(function () { return evidenceFor(it.card, it.titleEl); }, 'evidenceFor') : null
+    }));
+    const dom = raw.filter(x => x.ev);
+    if (dom.length >= 5) {
+      const m = learnModel(dom, model);
+      if (m && m !== model) { model = m; saveOosModel(model); }
+    }
+    const forced = ldTitleMap(ld);
+    if (forced) {
+      dom.forEach(x => {
+        const k = KEY(x.title);
+        if (k && forced.has(k) && !x.ev.hardOos && !x.ev.hardInStock) { x.ev.hardOos = true; x.ev.why.push('json-ld availability'); }
+      });
+    }
+    let activeModel = model;
+    const soft = dom.filter(x => !x.ev.hardOos && !x.ev.hardInStock);
+    if (model && soft.length >= 4) {
+      const hits = soft.filter(x => modelHit(model, x.ev.tokens) > 0).length;
+      if (hits / soft.length > 0.6) {
+        activeModel = null;
+        const strikes = (model.strikes || 0) + 1;
+        if (strikes >= 2) {
+          saveOosModel(null); model = null;
+          console.log('[Harvest] learned model discarded — flagged the majority of cards on 2 pages');
+        } else {
+          model = Object.assign({}, model, { strikes: strikes });
+          saveOosModel(model);
+          console.log('[Harvest] learned model suspended this page (' + hits + '/' + soft.length + ' soft cards hit)');
+        }
+      } else if (model.strikes) {
+        model = Object.assign({}, model, { strikes: 0 });
+        saveOosModel(model);
+      }
+    }
+    const stats = pageStats(dom);
+    const out = raw.map(x => ({ title: x.title, price: x.price, oos: decideOos(x, activeModel, relativeScore(x.ev, stats)), url: x.url || '', rating: x.rating, reviews: x.reviews }));
+    return { items: out, model: model };
+  }
+
+  /* ============================ UTILS ============================ */
+  function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
+  /* [v5.3.1] normalise Arabic digits + collapse split Arabic currencies */
+  function prepPriceText(t) {
+    return String(t || '')
+      /* Arabic-Indic digits ٠-٩ (U+0660-U+0669) → ASCII */
+      .replace(/[\u0660-\u0669]/g, function (d) { return String.fromCharCode(d.charCodeAt(0) - 0x0660 + 0x30); })
+      /* Extended Arabic-Indic / Persian digits ۰-۹ (U+06F0-U+06F9) → ASCII */
+      .replace(/[\u06F0-\u06F9]/g, function (d) { return String.fromCharCode(d.charCodeAt(0) - 0x06F0 + 0x30); })
+      .replace(/\s+/g, ' ')
+      .replace(/([A-Za-z])(\d)/g, '$1 $2')
+      .replace(/(\d)([A-Za-z])/g, '$1 $2')
+      .replace(DUP_CURRENCY, '$1')
+      .replace(/(EGP|USD|SAR|AED|EUR|GBP|LE)(?=\s*\1)/gi, '')
+      /* collapse "جنيه مصرى" to "جنيه" */
+      .replace(/(جنيه|جنية)\s*(?:مصري|مصرى|مصريًا)/g, '$1')
+      .trim();
+  }
+  function looksPrice(t) {
+    const s = prepPriceText(norm(t));
+    if (s.length < 2 || s.length > 80 || /%/.test(s) || /^[0-5][.,]\d$/.test(s)) return false;
+    return PRICE_RE.test(s);
+  }
+  function cleanPrice(t) {
+    const s = prepPriceText(norm(t));
+    const m = s.match(PRICE_RE);
+    const out = m ? norm(m[0]) : s.slice(0, 56);
+    return out.replace(/(EGP|SAR|AED|USD)(?:\1)+/gi, '$1').replace(/(\d)([A-Za-z])/g, '$1 $2');
+  }
+  function junkTitle(t, max) {
+    t = norm(t);
+    if (t.length < 4 || t.length > (max || 240)) return true;
+    if (SKIP_TITLES.test(t) || looksPrice(t) || /^[\d\s./-]+$/.test(t)) return true;
+    return false;
+  }
+  function textOf(el) { return el ? norm(el.textContent) : ''; }
+  function itemUrl(it) {
+    if (!it) return '';
+    if (it.url) return it.url;
+    const els = [it.titleEl, it.card];
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      if (!el || !el.tagName) continue;
+      if (el.tagName === 'A' && el.href) return el.href;
+      if (el.querySelector) {
+        const a = el.querySelector('a[href]');
+        if (a) return a.href;
+      }
+      if (el.closest) {
+        const a = el.closest('a[href]');
+        if (a) return a.href;
+      }
+    }
+    return '';
+  }
+  function unique(items) {
+    const map = new Map(); const out = [];
+    items.forEach((it) => {
+      const url = itemUrl(it);
+      const k = url || it.title.toLowerCase();
+      if (map.has(k)) {
+        const p0 = map.get(k);
+        if (!p0.rating && it.rating) p0.rating = it.rating;
+        if (!p0.reviews && it.reviews) p0.reviews = it.reviews;
+        if (it.oos) {
+          const p = map.get(k);
+          p.oos = true;
+          const e = p.card && OOS_CACHE.get(p.card);
+          if (e) e.hardOos = true;
+        }
+        return;
+      }
+      const c = { title: it.title, price: it.price, oos: !!it.oos, url: url, rating: it.rating || '', reviews: it.reviews || '', card: it.card || null, titleEl: it.titleEl || null };
+      map.set(k, c); out.push(c);
+    });
+    return out;
+  }
+  function qsAll(root, sel) {
+    try { return Array.from((root || document).querySelectorAll(sel)); } catch (e) { return []; }
+  }
+  function qs(root, sel) {
+    try { return (root || document).querySelector(sel); } catch (e) { return null; }
+  }
+  function cssEscape(value) {
+    return String(value).replace(/([ !"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+  }
+  function meaningfulClasses(el) {
+    const raw = typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '';
+    return raw.split(/\s+/).filter(Boolean)
+      .filter((c) => !UTIL_CLASS_RE.test(c) && c.length < 48 && !/(--active|--selected|^is-|^has-|^active$|^selected$|^current$|^ng-)/i.test(c));
+  }
+  function classSig(el) {
+    const classes = meaningfulClasses(el).slice(0, 5).sort();
+    return el.tagName.toLowerCase() + (classes.length ? '.' + classes.join('.') : '');
+  }
+  function mostCommon(values) {
+    if (!values.length) return undefined;
+    const counts = new Map();
+    values.forEach((v) => counts.set(v, (counts.get(v) || 0) + 1));
+    let best; let n = -1;
+    counts.forEach((c, k) => { if (c > n) { best = k; n = c; } });
+    return best;
+  }
+
+  /* ============================ PLATFORM SCRAPERS ============================ */
+  function amazonRating(card) {
+    let rating = '', reviews = '';
+    const block = card.querySelector('[data-cy="reviews-block"]') || card;
+    const alt = block.querySelector('.a-icon-alt');
+    if (alt) { const m = textOf(alt).match(/\d+(?:[.,]\d+)?/); if (m) rating = m[0].replace(',', '.'); }
+    const links = block.querySelectorAll('a[aria-label]');
+    for (let i = 0; i < links.length && !reviews; i++) {
+      const l = links[i].getAttribute('aria-label') || '';
+      if (/out of 5|stars|نجوم|من 5/i.test(l)) continue;
+      const m = l.match(/^\s*([\d.,]+)\s/);
+      if (m) reviews = m[1];
+    }
+    if (!reviews) {
+      const c = block.querySelector('span[data-rt], .s-underline-text');
+      if (c) reviews = textOf(c).replace(/[()]/g, '');
+    }
+    return { rating: rating, reviews: reviews };
+  }
+  function scrapeAmazon() {
+    const items = [];
+    document.querySelectorAll('div[data-asin]:not([data-asin=""])').forEach((card) => {
+      const hidden = card.closest('.a-carousel-card');
+      if (hidden && hidden.getAttribute('aria-hidden') === 'true') return;
+      const titleNode = card.querySelector('[data-cy="title-recipe"] h2 span, h2 span, h2, .a-size-medium.a-color-base.a-text-normal, .a-size-base-plus.a-color-base.a-text-normal');
+      const title = textOf(titleNode);
+      if (junkTitle(title, 1000)) return;
+      const off = card.querySelector('.a-price .a-offscreen');
+      const whole = card.querySelector('.a-price .a-price-whole');
+      const frac = card.querySelector('.a-price .a-price-fraction');
+      let price = 'N/A';
+      if (off) price = textOf(off);
+      else if (whole) price = textOf(whole).replace(/[.,]$/, '') + (frac ? '.' + textOf(frac) : '');
+      const rv = amazonRating(card);
+      items.push({ title, price, oos: soldOutIn(card, titleNode), card, titleEl: titleNode, rating: rv.rating, reviews: rv.reviews });
+    });
+    return unique(items);
+  }
+  function scrapeNoon() {
+    const items = [];
+    let cards = document.querySelectorAll('[data-qa="plp-grid"] [data-qa="plp-product-box"]');
+    if (!cards.length) cards = document.querySelectorAll('[data-qa="plp-product-box"]');
+    cards.forEach((card) => {
+      const titleEl = card.querySelector('[data-qa="plp-product-box-name"], [data-qa="product-box-name"], [data-qa$="product-box-name"]');
+      const title = norm((titleEl && (titleEl.getAttribute('title') || titleEl.textContent)) || '');
+      if (junkTitle(title, 1000)) return;
+      const box = card.querySelector('[data-qa="plp-product-box-price"], [data-qa="product-box-price"], [data-qa$="product-box-price"]');
+      let price = 'N/A';
+      if (box) {
+        const cur = box.querySelector('[class*="currency"]');
+        const amt = box.querySelector('[class*="amount"]');
+        if (amt) price = (cur ? textOf(cur) + ' ' : '') + textOf(amt);
+        else if (looksPrice(textOf(box))) price = cleanPrice(textOf(box));
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+  function scrapeDubaiPhone() {
+    const items = [];
+    /* [v5.3] include article.nf-product-card and skip composite rows */
+    document.querySelectorAll('article.nf-product-card, .nf-product-card').forEach((card) => {
+      if (inHijackZone(card) || inBoilerplate(card)) return;
+      if (isCompositeCard(card)) return;
+      const titleEl = card.querySelector('.dp-product-title, h3, a[href]');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      /* [v5.3.2] price is split across sibling spans; find the numeric one and read its row */
+      let price = 'N/A';
+      const numEl = Array.from(card.querySelectorAll('[class*="tabular-nums"]'))
+        .find((e) => /^[\d٠-٩][\d,.٠-٩\s]*$/.test(textOf(e)));
+      if (numEl) {
+        const row = numEl.closest('div');          // holds "215,500 EGP EGP"
+        const rowText = textOf(row);
+        price = looksPrice(rowText) ? cleanPrice(rowText) : textOf(numEl);
+      }
+      const isOos = soldOutIn(card, titleEl);
+      if (price === 'N/A') bumpOos(card, titleEl, 3, 'no price (coming soon)');
+      items.push({ title, price, oos: isOos, card, titleEl });
+    });
+    /* [v5.3] from v5.1: fallback to /shop/ links */
+    if (items.length < 2) {
+      document.querySelectorAll('a[href*="/shop/"]').forEach((a) => {
+        if (inHijackZone(a) || inBoilerplate(a)) return;
+        const card = a.closest('article, li, div[class*="card" i], div[class*="product" i]') || a.parentElement;
+        if (!card || isCompositeCard(card)) return;
+        const title = norm(a.getAttribute('title') || textOf(a));
+        if (junkTitle(title)) return;
+        const priceEl = findPriceEl(card);
+        let price = 'N/A';
+        if (priceEl && looksPrice(textOf(priceEl))) price = cleanPrice(textOf(priceEl));
+        items.push({ title, price, oos: soldOutIn(card, a), card, titleEl: a });
+      });
+    }
+    return unique(items);
+  }
+  function shopifyCardFor(links, handle) {
+    let card = links[0];
+    let guard = 0;
+    while (card && card !== document.body && card !== document.documentElement && guard++ < 12) {
+      let foreign = false;
+      let own = 0;
+      const all = card.querySelectorAll('a[href*="/products/"]');
+      for (let i = 0; i < all.length; i++) {
+        const m = (all[i].getAttribute('href') || '').match(/\/products\/([^\/?#]+)/);
+        if (!m) continue;
+        if (m[1] === handle) own++;
+        else { foreign = true; break; }
+      }
+      if (!foreign && own >= links.length) return card;
+      card = card.parentElement;
+    }
+    let n = links[0];
+    while (n && n !== document.body) {
+      if (n.querySelector && n.querySelector('img')) return n;
+      n = n.parentElement;
+    }
+    return links[0].parentElement;
+  }
+  function scrapeShopifyByLinks() {
+    const groups = new Map();
+    qsAll(document, 'a[href*="/products/"]').forEach((a) => {
+      if (inHijackZone(a) || inBoilerplate(a)) return;
+      let handle = null;
+      try {
+        const u = new URL(a.href, location.href);
+        const m = u.pathname.match(/\/products\/([^\/?#]+)/);
+        if (m) handle = m[1];
+      } catch (e) { return; }
+      if (!handle) return;
+      if (!groups.has(handle)) groups.set(handle, []);
+      groups.get(handle).push(a);
+    });
+    const items = [];
+    groups.forEach((links, handle) => {
+      const card = shopifyCardFor(links, handle);
+      if (!card || inHijackZone(card) || inBoilerplate(card)) return;
+      if (isCompositeCard(card)) return;
+      let titleLink = links.reduce((best, l) => (textOf(l).length > textOf(best).length ? l : best), links[0]);
+      let title = textOf(titleLink);
+      if (junkTitle(title)) {
+        const img = card.querySelector('img[alt]');
+        const alt = img ? norm(img.getAttribute('alt')) : '';
+        if (!junkTitle(alt)) { title = alt; titleLink = img; }
+      }
+      if (junkTitle(title)) return;
+      const priceEl = findPriceEl(card);
+      const price = priceEl && looksPrice(textOf(priceEl)) ? cleanPrice(textOf(priceEl)) : 'N/A';
+      items.push({ title: title, price: price, oos: soldOutIn(card, titleLink), card: card, titleEl: titleLink });
+    });
+    return unique(items);
+  }
+  function scrapeShopify() {
+    let items = [];
+    try {
+      document.querySelectorAll('.product-card, .product-card__wrapper, [data-product-card], product-card.card--product, .card-wrapper, .grid-product, .product-item, .t4s-product, .t4s-pr').forEach((card) => {
+        if (inHijackZone(card) || inBoilerplate(card)) return;
+        if (isCompositeCard(card)) return;
+        const titleEl = card.querySelector(".product-card__title, .product-card__name, .card__heading, .card__title .card-link, .card__title, h3, h2, a[href*='/products/'], .t4s-product-title a, .t4s-product-title");
+        const title = textOf(titleEl);
+        if (junkTitle(title)) return;
+        const priceEl = card.querySelector('.price__current .js-value, .price-item--sale, .price-item--regular, .price, .money, .product-card__price, [data-pr-price], .t4s-product-price');
+        let price = priceEl && looksPrice(textOf(priceEl)) ? cleanPrice(textOf(priceEl)) : 'N/A';
+        const was = card.querySelector('.price__was .js-value, .price-item--compare, s, del');
+        if (was && looksPrice(textOf(was))) price += ' (was ' + cleanPrice(textOf(was)) + ')';
+        items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+      });
+    } catch (err) {
+      recordError('scrapeShopify (selector pass)', err);
+      console.error('[Harvest] scrapeShopify selector pass crashed:', err);
+    }
+    if (items.length < 2) {
+      const byLinks = safeCall(scrapeShopifyByLinks, 'scrapeShopifyByLinks') || [];
+      if (byLinks.length > items.length) items = byLinks;
+    }
+    if (!items.length && window.ShopifyAnalytics && window.ShopifyAnalytics.meta && window.ShopifyAnalytics.meta.products) {
+      const prods = window.ShopifyAnalytics.meta.products;
+      const arr = Array.isArray(prods) ? prods : [prods];
+      const currency = (window.Shopify && window.Shopify.currency && window.Shopify.currency.active) || '';
+      arr.forEach((p) => {
+        const title = (p.variants && p.variants[0] && p.variants[0].name) || p.handle;
+        const price = p.variants && p.variants[0] && p.variants[0].price != null
+          ? (p.variants[0].price / 100).toLocaleString() + (currency ? ' ' + currency : '') : 'N/A';
+        const variants = p.variants || [];
+        const oos = p.available === false || (variants.length > 0 && variants.every((v) => v.available === false));
+        if (title && !junkTitle(title)) items.push({ title, price, oos, card: null, titleEl: null });
+      });
+    }
+    return unique(items);
+  }
+  function scrapeWoo() {
+    const items = [];
+    document.querySelectorAll('.product-small.col.product.type-product, li.product, ul.products li.product, .product.type-product').forEach((card) => {
+      if (inHijackZone(card) || inBoilerplate(card)) return;
+      if (isCompositeCard(card)) return;
+      const titleEl = card.querySelector('.woocommerce-loop-product__title a, .product-title a, a.woocommerce-LoopProduct-link, h2 a, h3 a, h2, h3');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const wrap = card.querySelector('.price-wrapper .price, span.price, .price');
+      let price = 'N/A';
+      if (wrap) {
+        const neu = wrap.querySelector('ins .woocommerce-Price-amount, ins .amount');
+        const old = wrap.querySelector('del .woocommerce-Price-amount, del .amount');
+        const normal = wrap.querySelector('.woocommerce-Price-amount, .amount');
+        if (neu) { price = textOf(neu); if (old) price += ' (was ' + textOf(old) + ')'; }
+        else if (normal) price = textOf(normal);
+        else if (looksPrice(textOf(wrap))) price = cleanPrice(textOf(wrap));
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+  function scrapeOpenCart() {
+    const items = [];
+    document.querySelectorAll('div.product-thumb, .product-layout').forEach((card) => {
+      if (isCompositeCard(card)) return;
+      const titleEl = card.querySelector('.caption .name a, .name a, .caption h4 a, h4 a');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const priceDiv = card.querySelector('.price');
+      let price = 'N/A';
+      if (priceDiv) {
+        const neu = priceDiv.querySelector('.price-new');
+        const old = priceDiv.querySelector('.price-old');
+        const normal = priceDiv.querySelector('.price-normal');
+        if (neu) { price = textOf(neu); if (old) price += ' (was ' + textOf(old) + ')'; }
+        else if (normal) price = textOf(normal);
+        else if (looksPrice(textOf(priceDiv))) price = cleanPrice(textOf(priceDiv));
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+  function scrapePresta() {
+    const items = [];
+    document.querySelectorAll('#js-product-list article.product-miniature, article.product-miniature').forEach((card) => {
+      if (isCompositeCard(card)) return;
+      const titleEl = card.querySelector('h2.product-title a, .product-title a, h3 a');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const wrap = card.querySelector('.product-price-and-shipping, .product-price');
+      let price = 'N/A';
+      if (wrap) {
+        const cur = wrap.querySelector('.price');
+        const old = wrap.querySelector('.regular-price');
+        if (cur) { price = textOf(cur); if (old) price += ' (was ' + textOf(old) + ')'; }
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+  function scrapeMagento() {
+    const items = [];
+    document.querySelectorAll('li.product-item, .product-item-info').forEach((card) => {
+      if (isCompositeCard(card)) return;
+      const titleEl = card.querySelector('.product-item-name a, .product-item-link, a.product-item-link');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const priceEl = card.querySelector('.price, [data-price-amount]');
+      let price = 'N/A';
+      if (priceEl) price = priceEl.getAttribute('data-price-amount') || textOf(priceEl);
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+  function scrapeCsCart() {
+    const items = [];
+    document.querySelectorAll('.ut2-gl__item').forEach((card) => {
+      if (isCompositeCard(card)) return;
+      const a = card.querySelector('a.product-title');
+      const title = norm((a && (a.getAttribute('title') || a.textContent)) || '');
+      if (junkTitle(title)) return;
+      const p = card.querySelector('.ty-price');
+      const price = p && looksPrice(textOf(p)) ? cleanPrice(textOf(p)) : 'N/A';
+      const amt = card.querySelector('.ut2-gl__amount');
+      const platformOos = !!card.querySelector('.ty-qty-out-of-stock') ||
+        (!!amt && !card.querySelector('.ty-qty-in-stock') && /نفذ|نفدت|غير\s*متوفر|غير\s*متاح/.test(textOf(amt)));
+      if (platformOos) bumpOos(card, a, 3, 'CS-Cart stock flag');
+      items.push({ title, price, oos: soldOutIn(card, a), card, titleEl: a });
+    });
+    return unique(items);
+  }
+  function scrapeDubizzle() {
+    const items = [];
+    document.querySelectorAll('li[aria-label="Listing"]').forEach((card) => {
+      const titleEl = card.querySelector('[aria-label="Title"] h2, [aria-label="Title"]');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const box = card.querySelector('[aria-label="Price"]');
+      const price = box ? textOf(box.firstElementChild || box) : 'N/A';
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+  function scrapeSigma() {
+    const items = [];
+    document.querySelectorAll('a.line-clamp-2[href*="/item?id="], a[href*="/item?id="]').forEach((a) => {
+      const title = textOf(a);
+      if (junkTitle(title)) return;
+      const card = a.closest('.rounded-2xl') || (a.parentElement && a.parentElement.parentElement);
+      let price = 'N/A';
+      if (card) {
+        const priceContainer = card.querySelector('[class*="price" i], [class*="amount" i], [class*="money" i]');
+        if (priceContainer) {
+          const t = textOf(priceContainer);
+          if (looksPrice(t)) price = cleanPrice(t);
+        } else {
+          const prices = Array.from(card.querySelectorAll('div, p, span')).map((el) => textOf(el)).filter((t) => /^[\d,]+(?:\.\d+)?\s*EGP$/.test(t) || looksPrice(t));
+          if (prices.length) price = prices[0];
+        }
+      }
+      items.push({ title, price, oos: card ? soldOutIn(card, a) : false, card: card || null, titleEl: a });
+    });
+    return unique(items);
+  }
+  function scrapeYalla() {
+    const items = [];
+    document.querySelectorAll('article.yalla-product-card, [data-yalla-product-id], .yalla-product-card').forEach((card) => {
+      const titleEl = card.querySelector('.yalla-product-card__title, h4, h3, a.productLink');
+      let title = textOf(titleEl);
+      let usedEl = titleEl;
+      if (junkTitle(title)) {
+        const img = card.querySelector('img[alt]');
+        title = img ? norm(img.getAttribute('alt')) : '';
+        if (!junkTitle(title)) usedEl = null;
+      }
+      if (junkTitle(title)) return;
+      const priceEl = card.querySelector('.yalla-product-card__price, .yalla-product-card__pricing');
+      let price = 'N/A';
+      if (priceEl) {
+        const t = textOf(priceEl);
+        if (looksPrice(t)) price = cleanPrice(t);
+        else {
+          const amount = textOf(priceEl.querySelector('span'));
+          const cur = textOf(priceEl.querySelector('small'));
+          const joined = norm(amount + ' ' + cur);
+          if (joined) price = looksPrice(joined) ? cleanPrice(joined) : joined;
+        }
+      }
+      items.push({ title, price, oos: soldOutIn(card, usedEl), card, titleEl: usedEl });
+    });
+    return unique(items);
+  }
+
+  /* [v5.3] Samsung scraper (from v5.1) */
+  function scrapeSamsung() {
+    const items = [];
+    document.querySelectorAll('.pd21-product-card__item:not(.pd21-product-card__banner):not([class*="banner"])').forEach((card) => {
+      if (inHijackZone(card) || inBoilerplate(card)) return;
+      if (isCompositeCard(card)) return;
+      const titleEl = card.querySelector('.pd21-product-card__name a, .pd21-product-card__name, h3 a, h3, h4');
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const pEl = findPriceEl(card);
+      let price = 'N/A';
+      if (pEl) {
+        const t = textOf(pEl);
+        if (looksPrice(t)) price = cleanPrice(t);
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+
+  /* [v5.3] SharafDG / Algolia scraper (from v5.1) */
+  function scrapeSharaf() {
+    const items = [];
+    document.querySelectorAll('.ais-Hits-item, .ais-InfiniteHits-item, li.product, .product.type-product, [class*="product-box"]').forEach((card) => {
+      if (inHijackZone(card) || inBoilerplate(card)) return;
+      if (isCompositeCard(card)) return;
+      const titleEl = findTitleEl(card);
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const pEl = findPriceEl(card);
+      let price = 'N/A';
+      if (pEl) {
+        const t = textOf(pEl);
+        if (looksPrice(t)) price = cleanPrice(t);
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+
+  /* [v5.3] Vodafone scraper (from v5.1) */
+  function scrapeVodafone() {
+    const items = [];
+    document.querySelectorAll('.vf-product-card, article.product, .product-item, [class*="product-card"], [data-product-code]').forEach((card) => {
+      if (inHijackZone(card) || inBoilerplate(card)) return;
+      if (isCompositeCard(card)) return;
+      const titleEl = findTitleEl(card);
+      const title = textOf(titleEl);
+      if (junkTitle(title)) return;
+      const pEl = findPriceEl(card);
+      let price = 'N/A';
+      if (pEl) {
+        const t = textOf(pEl);
+        if (looksPrice(t)) price = cleanPrice(t);
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    return unique(items);
+  }
+
+  /* [v5.3] Algolia helpers (from v5.1) */
+  function isAlgoliaSite() {
+    return host.indexOf('sharafdg') !== -1 || !!document.querySelector('.ais-Hits, .ais-InfiniteHits, .ais-Pagination');
+  }
+  /* Journal3 infinite scroll (IAS) — append-based, must not be scrolled by the runner */
+  function isIasSite() {
+    return !!(window.Journal && window.Journal.infiniteScrollStatus) ||
+           !!document.querySelector('.ias-trigger, .ias-noneleft, .ias-spinner');
+  }
+  function findAlgoliaNext() {
+    return qs(document, '.ais-Pagination-item--next:not(.ais-Pagination-item--disabled) a[href], .ais-Pagination-item--next:not(.ais-Pagination-item--disabled) button');
+  }
+
+  function scrapeJsonLd() {
+    const items = [];
+    function walk(node) {
+      if (!node) return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (typeof node !== 'object') return;
+      const t = node['@type'];
+      const type = (typeof t === 'string' ? t : Array.isArray(t) ? t.join(',') : '').toLowerCase();
+      if (type.indexOf('product') !== -1 && typeof node.name === 'string' && !junkTitle(node.name)) {
+        let price = 'N/A';
+        const offers = Array.isArray(node.offers) ? node.offers : node.offers ? [node.offers] : [];
+        const isOut = (o) => o && /outofstock|soldout|sold_out|out_of_stock|discontinued/i.test(String(o.availability || o.itemAvailability || ''));
+        let oos = offers.length > 0 && offers.every(isOut);
+        for (const o of offers) {
+          if (o) {
+            const p = o.price != null ? o.price : o.lowPrice;
+            if (p != null) {
+              price = (o.priceCurrency ? o.priceCurrency + ' ' : '') + String(p);
+              break;
+            }
+          }
+        }
+        const av2 = String(node.availability || '');
+        if (/outofstock|soldout/i.test(av2)) oos = true;
+        items.push({ title: norm(node.name), price, oos, card: null, titleEl: null });
+      }
+      if (node['@graph']) walk(node['@graph']);
+      if (node.itemListElement) walk(node.itemListElement);
+      if (node.item) walk(node.item);
+    }
+    document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+      try { walk(JSON.parse(s.textContent || 'null')); } catch (e) { /* ignore */ }
+    });
+    return unique(items);
+  }
+
+  /* ============================ SOURCE COMPILER ============================ */
+  function findTitleEl(card) {
+    for (let i = 0; i < TITLE_SELS.length; i++) {
+      const el = qs(card, TITLE_SELS[i]);
+      if (el && !junkTitle(textOf(el))) return el;
+    }
+    const img = card.querySelector('img[alt]');
+    if (img && !junkTitle(norm(img.getAttribute('alt')))) return img;
+    return null;
+  }
+  function findPriceEl(card) {
+    const hinted = qsAll(card, PRICE_HINT);
+    for (let i = 0; i < hinted.length; i++) {
+      const el = hinted[i];
+      const t = textOf(el);
+      if (looksPrice(t)) return el;
+      const attr = el.getAttribute('content') || el.getAttribute('data-price') || el.getAttribute('data-price-amount');
+      if (attr && looksPrice(attr)) return el;
+    }
+    const all = card.querySelectorAll('span, div, p, b, strong, em, h3, h4, h5, small');
+    for (let i = 0; i < all.length; i++) {
+      if (all[i].childElementCount > 3) continue;
+      const t = textOf(all[i]);
+      if (t.length <= 56 && looksPrice(t)) return all[i];
+    }
+    return null;
+  }
+  function relativeSelector(card, target) {
+    if (!target || card === target) return ':scope';
+    const tag = target.tagName.toLowerCase();
+    const meaningful = meaningfulClasses(target);
+    if (meaningful.length) {
+      const sel = tag + '.' + meaningful.slice(0, 2).map(cssEscape).join('.');
+      if (qsAll(card, sel).length <= 3) return sel;
+    }
+    const itemprop = target.getAttribute('itemprop');
+    if (itemprop) return '[itemprop="' + cssEscape(itemprop) + '"]';
+    const dataKeys = ['data-price', 'data-price-amount', 'data-qa'];
+    for (let i = 0; i < dataKeys.length; i++) {
+      if (target.getAttribute(dataKeys[i]) != null) {
+        const v = target.getAttribute(dataKeys[i]);
+        return v ? '[' + dataKeys[i] + '="' + cssEscape(v) + '"]' : '[' + dataKeys[i] + ']';
+      }
+    }
+    if (tag === 'img') return 'img[alt]';
+    if (/^h[1-6]$/.test(tag)) {
+      const withA = target.querySelector('a') ? tag + ' a' : tag;
+      if (qsAll(card, withA).length <= 3) return withA;
+    }
+    if (target.getAttribute('href')) return 'a[href]';
+    const parent = target.parentElement;
+    if (parent && parent !== card) {
+      const parentSel = relativeSelector(card, parent);
+      const kids = Array.from(parent.children).filter((c) => c.tagName === target.tagName);
+      const idx = kids.indexOf(target);
+      if (idx >= 0 && kids.length > 1) return parentSel + ' > ' + tag + ':nth-of-type(' + (idx + 1) + ')';
+      return parentSel + ' > ' + tag;
+    }
+    return tag;
+  }
+  function sharedCardSelector(cards) {
+    if (!cards.length) return '';
+    const dataAttrs = ['data-product-id', 'data-product-card', 'data-sku', 'data-asin', 'data-id', 'data-yalla-product-id'];
+    for (let i = 0; i < dataAttrs.length; i++) {
+      const attr = dataAttrs[i];
+      if (cards.every((c) => c.getAttribute(attr))) {
+        const sel = '[' + attr + ']';
+        const n = qsAll(document, sel).length;
+        if (n >= 2 && n <= Math.max(cards.length * 2, 8)) return sel;
+      }
+    }
+    const tag = cards[0].tagName.toLowerCase();
+    if (cards.every((c) => c.tagName.toLowerCase() === tag)) {
+      const lists = cards.map(meaningfulClasses);
+      const shared = lists[0].filter((c) => lists.every((l) => l.indexOf(c) !== -1));
+      if (shared.length) {
+        const sel = tag + '.' + shared.slice(0, 3).map(cssEscape).join('.');
+        const n = qsAll(document, sel).length;
+        if (n >= 2) return sel;
+      }
+      const first = meaningfulClasses(cards[0]);
+      if (first.length) {
+        const sel = tag + '.' + first.slice(0, 3).map(cssEscape).join('.');
+        if (qsAll(document, sel).length >= 2) return sel;
+      }
+    }
+    const parent = cards[0].parentElement;
+    if (parent) {
+      const pcls = meaningfulClasses(parent).slice(0, 2).map(cssEscape);
+      const parentSel = pcls.length ? parent.tagName.toLowerCase() + '.' + pcls.join('.') : parent.tagName.toLowerCase();
+      return parentSel + ' > ' + tag;
+    }
+    return tag;
+  }
+  function clusterFromSource() {
+    const priceEls = [];
+    qsAll(document, PRICE_HINT).forEach((el) => { if (looksPrice(textOf(el))) priceEls.push(el); });
+    if (priceEls.length < 2) {
+      document.querySelectorAll('span, div, p, b, strong, em, h3, h4, h5').forEach((el) => {
+        if (el.childElementCount > 3) return;
+        const t = textOf(el);
+        if (t.length <= 56 && looksPrice(t)) priceEls.push(el);
+      });
+    }
+    const clusters = new Map();
+    function consider(cards, signature, score) {
+      /* [v5.3] filter composite rows */
+      cards = cards.filter((c) => !isCompositeCard(c));
+      if (cards.length < 2) return;
+      if (HIJACK_RE.test(signature)) return;
+      if (inHijackZone(cards[0]) || inBoilerplate(cards[0])) return;
+      const key = signature + ':' + cards.length;
+      const prev = clusters.get(key);
+      if (!prev || score > prev.score) clusters.set(key, { cards, score, signature });
+    }
+    function clusterWalk(anchors, relevant) {
+      anchors.forEach((anchor) => {
+        let node = anchor;
+        let depth = 0;
+        while (node && node !== document.body && depth < 10) {
+          const parent = node.parentElement;
+          if (!parent) break;
+          const sig = classSig(node);
+          const siblings = Array.from(parent.children).filter((c) => c.tagName === node.tagName && classSig(c) === sig);
+          if (siblings.length >= 2) {
+            const good = siblings.filter(relevant);
+            if (good.length >= 2) {
+              const score = good.length * 4 + good.filter((c) => c.querySelector('img')).length * 2 + good.filter((c) => c.querySelector('a[href]')).length * 2 - depth;
+              consider(good, sig, score);
+            }
+          }
+          node = parent;
+          depth += 1;
+        }
+      });
+    }
+    clusterWalk(priceEls, (s) => PRICE_RE.test(textOf(s)) || !!qs(s, PRICE_HINT));
+    const productLinks = qsAll(document, 'a[href*="/products/"], a[href*="/product/"], a[href*="/shop/"]')
+      .filter((a) => !inHijackZone(a) && !inBoilerplate(a));
+    if (productLinks.length >= 3) {
+      clusterWalk(productLinks, (s) =>
+        !!qs(s, 'a[href*="/products/"], a[href*="/product/"], a[href*="/shop/"]') && !!s.querySelector('img'));
+    }
+    ['article.product', 'article.product-card', 'article.product-miniature', 'li.product', 'li.product-item',
+      '[data-product-card]', '[data-product-id]', '.product-card', '.product-item', '.product-tile',
+      '.grid-product', '.t4s-pr', '.t4s-product', '.nf-product-card', '.device-card', '.product-box',
+      /* [v5.3] Samsung / Algolia / Vodafone */
+      '.pd21-product-card__item', '.ais-Hits-item', '.ais-InfiniteHits-item',
+      '.vf-product-card', '[class*="product-card"]'].forEach((sel) => {
+        const cards = qsAll(document, sel).filter((c) => !inHijackZone(c) && !inBoilerplate(c) && !isCompositeCard(c));
+        if (cards.length >= 2) consider(cards, sel, cards.length * 3 + 8);
+      });
+    return Array.from(clusters.values()).sort((a, b) => b.score - a.score);
+  }
+  function deriveSelectors(cards) {
+    const card = sharedCardSelector(cards);
+    const titleSels = []; const priceSels = []; const linkSels = []; const imageSels = []; const oosSels = [];
+    cards.forEach((c) => {
+      const titleEl = findTitleEl(c);
+      if (titleEl) titleSels.push(relativeSelector(c, titleEl));
+      const priceEl = findPriceEl(c);
+      if (priceEl) priceSels.push(relativeSelector(c, priceEl));
+      if (c.matches && c.matches('a[href]')) linkSels.push(':scope');
+      else {
+        const a = c.querySelector('a[href]');
+        if (a) {
+          const m = meaningfulClasses(a);
+          linkSels.push(m.length ? 'a.' + m.slice(0, 2).map(cssEscape).join('.') : 'a[href]');
+        }
+      }
+      if (c.querySelector('img[alt]')) imageSels.push('img[alt]');
+      const oos = qs(c, '[class*="sold-out" i], [class*="sold_out" i], [class*="soldout" i], [class*="out-of-stock" i], [class*="out_of_stock" i], [class*="outofstock" i], [class*="unavailable" i], [class~="oos" i], [data-available="false"], [data-sold-out="true"]');
+      if (oos) oosSels.push(relativeSelector(c, oos));
+    });
+    const nextSel = ['a[rel="next"]', 'a.pagination__next', 'a.next.page-numbers', 'a.s-pagination-next', 'a.next'].find((s) => qs(document, s));
+    return {
+      card,
+      title: mostCommon(titleSels) || 'h2, h3, a[href]',
+      price: mostCommon(priceSels) || '[class*="price" i], [itemprop="price"]',
+      link: mostCommon(linkSels),
+      image: mostCommon(imageSels),
+      oos: mostCommon(oosSels),
+      next: nextSel
+    };
+  }
+  function applySelectors(selectors) {
+    if (!selectors || !selectors.card) return [];
+    const items = [];
+    let skippedZone = 0;
+    let skippedComposite = 0;
+    qsAll(document, selectors.card).forEach((card) => {
+      if (inHijackZone(card) || inBoilerplate(card)) { skippedZone++; return; }
+      /* [v5.3] */
+      if (isCompositeCard(card)) { skippedComposite++; return; }
+      let titleEl = selectors.title ? qs(card, selectors.title) : findTitleEl(card);
+      let title = textOf(titleEl);
+      let isImgTitle = !!(titleEl && titleEl.tagName === 'IMG');
+      if (junkTitle(title) && selectors.image) {
+        const img = qs(card, selectors.image);
+        title = img ? norm(img.getAttribute('alt')) : title;
+        if (!junkTitle(title)) { titleEl = img || titleEl; isImgTitle = true; }
+      }
+      if (junkTitle(title)) {
+        const img = card.querySelector('img[alt]');
+        title = img ? norm(img.getAttribute('alt')) : title;
+        if (img && !junkTitle(title)) { titleEl = img; isImgTitle = true; }
+      }
+      if (junkTitle(title)) return;
+      let price = 'N/A';
+      const pEl = selectors.price ? qs(card, selectors.price) : findPriceEl(card);
+      if (pEl) {
+        const t = textOf(pEl);
+        if (looksPrice(t)) price = cleanPrice(t);
+        else {
+          const attr = pEl.getAttribute('content') || pEl.getAttribute('data-price') || pEl.getAttribute('data-price-amount');
+          if (attr && looksPrice(attr)) price = cleanPrice(attr);
+          else if (t) price = cleanPrice(t);
+        }
+      }
+      try {
+        evidenceFor(card, titleEl);
+        if (selectors.oos && qs(card, selectors.oos)) bumpOos(card, titleEl, 3, 'compiled oos selector');
+      } catch (err) {
+        recordError('applySelectors (evidence)', err);
+        console.error('[Harvest] evidence crashed on card:', err);
+      }
+      items.push({ title, price, oos: soldOutIn(card, titleEl), card, titleEl });
+    });
+    if (skippedZone) console.log('[Harvest] skipped ' + skippedZone + ' card(s) in recommendation/boilerplate zone');
+    if (skippedComposite) console.log('[Harvest] skipped ' + skippedComposite + ' composite row(s)');
+    return unique(items);
+  }
+  function ldTitleOverlap(applied, jsonld) {
+    const ldKeys = jsonld.map((j) => KEY(j.title)).filter((k) => k.length > 3);
+    if (!ldKeys.length) return true;
+    return applied.some((it) => {
+      const k = KEY(it.title);
+      if (k.length <= 3) return false;
+      return ldKeys.some((lk) => lk === k ||
+        (Math.min(lk.length, k.length) >= 10 && (lk.indexOf(k) === 0 || k.indexOf(lk) === 0)));
+    });
+  }
+  function compileFromSource() {
+    const ranked = clusterFromSource();
+    const jsonld = scrapeJsonLd();
+    if (!ranked.length) {
+      return {
+        items: jsonld,
+        blueprint: jsonld.length >= 2 ? { method: 'json-ld', host, selectors: { card: '', title: 'Product.name', price: 'Offer.price' }, notes: 'JSON-LD Product nodes' } : null
+      };
+    }
+    const best = ranked[0];
+    const selectors = deriveSelectors(best.cards);
+    const applied = applySelectors(selectors);
+    console.log('[Harvest] compiled cluster:', best.signature, '×', best.cards.length);
+    if (applied.length && jsonld.length >= 3 && !ldTitleOverlap(applied, jsonld)) {
+      return { items: jsonld, blueprint: { method: 'json-ld', host, selectors: { card: '', title: 'Product.name', price: 'Offer.price' }, notes: 'JSON-LD Product nodes · compiled grid failed title cross-check' } };
+    }
+    const blueprint = {
+      method: 'source',
+      host,
+      selectors,
+      notes: 'Compiled from source · ' + best.signature + ' × ' + best.cards.length + ' · card `' + selectors.card + '`'
+    };
+    if (applied.length < 2 && jsonld.length > applied.length) {
+      return { items: jsonld, blueprint: { method: 'json-ld', host, selectors: { card: '', title: 'Product.name', price: 'Offer.price' }, notes: 'JSON-LD Product nodes' } };
+    }
+    return { items: applied, blueprint };
+  }
+  function saveBlueprint(bp) {
+    if (!bp) return;
+    try { sessionStorage.setItem(BLUEPRINT_KEY, JSON.stringify(bp)); } catch (e) { /* ignore */ }
+  }
+  function loadBlueprint() {
+    try {
+      const bp = JSON.parse(sessionStorage.getItem(BLUEPRINT_KEY) || 'null');
+      if (bp && bp.host === host && bp.selectors && bp.selectors.card) {
+        if (HIJACK_RE.test(bp.selectors.card) || HIJACK_RE.test(bp.selectors.title || '') ||
+            HIJACK_RE.test(bp.selectors.price || '') || HIJACK_RE.test(bp.selectors.oos || '')) {
+          sessionStorage.removeItem(BLUEPRINT_KEY);
+          console.log('[Harvest] discarded hijacked blueprint:', bp.selectors.card);
+          return null;
+        }
+        return bp;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  /* ============================ DETECTION & CURRENT PAGE ============================ */
+  function detectPlatform() {
+    if (host.indexOf('amazon.') !== -1 || document.querySelector('div[data-asin] h2')) return 'amazon';
+    if (host.indexOf('noon.com') !== -1 || document.querySelector('[data-qa="plp-product-box"]')) return 'noon';
+    if (host.indexOf('dubizzle') !== -1 || document.querySelector('li[aria-label="Listing"]')) return 'dubizzle';
+    if (host.indexOf('sigma-computer') !== -1 || document.querySelector('a[href*="/item?id="]')) return 'sigma';
+    if (host.indexOf('dubaiphone.net') !== -1 || document.querySelector('.nf-product-card')) return 'dubaiphone';
+    /* [v5.3] Samsung / SharafDG / Vodafone */
+    if (host.indexOf('samsung.') !== -1 || document.querySelector('.pd21-product-finder, .pd21-product-card, .js-pfv2-finder')) return 'samsung';
+    if (host.indexOf('sharafdg') !== -1 || document.querySelector('.ais-Hits, .ais-InfiniteHits, .ais-Pagination')) return 'sharaf';
+    if (host.indexOf('vodafone') !== -1 || document.querySelector('vf-root, .vf-product-card, [class*="vf-product"]')) return 'vodafone';
+    if (document.querySelector('article.yalla-product-card, [data-yalla-product-id], .yalla-product-card')) return 'yalla';
+    if (document.querySelector('meta[name="shopify-checkout-api-token"], [data-shopify], product-card.card--product, .product-card, [data-product-card], script#shopify-features, #shopify-digital-wallet, html.t4sp-theme, .t4s-product, .t4s-pr') ||
+        (window.Shopify && window.Shopify.shop)) return 'shopify';
+    if (document.querySelector('.woocommerce, .woocommerce-loop-product__title, ul.products li.product')) return 'woocommerce';
+    if (document.querySelector('div.product-thumb, .product-layout .product-thumb')) return 'opencart';
+    if (document.querySelector('article.product-miniature, #js-product-list')) return 'prestashop';
+    if (document.querySelector('li.product-item .product-item-link, .product-item-info')) return 'magento';
+    if (document.querySelector('.ut2-gl__item')) return 'cscart';
+    if (document.querySelector('script[type="application/ld+json"]')) return 'json-ld';
+    return 'unknown';
+  }
+  function scrapeCurrentPage() {
+    OOS_CACHE = new WeakMap();
+    const p = safeCall(detectPlatform, 'detectPlatform') || 'unknown';
+    const scrapers = {
+      amazon: scrapeAmazon, noon: scrapeNoon, dubizzle: scrapeDubizzle, sigma: scrapeSigma,
+      yalla: scrapeYalla, shopify: scrapeShopify, woocommerce: scrapeWoo, opencart: scrapeOpenCart,
+      prestashop: scrapePresta, magento: scrapeMagento, cscart: scrapeCsCart, dubaiphone: scrapeDubaiPhone,
+      /* [v5.3] */
+      samsung: scrapeSamsung, sharaf: scrapeSharaf, vodafone: scrapeVodafone
+    };
+    let items = scrapers[p] ? safeCall(scrapers[p], 'scrape' + p) : null;
+    let ldPre = null;
+    if ((!items || !items.length) && p === 'json-ld') {
+      const ld = safeCall(scrapeJsonLd, 'scrapeJsonLd') || [];
+      const comp = safeCall(compileFromSource, 'compileFromSource');
+      if (comp && comp.items && comp.items.length > ld.length) { items = comp.items; ldPre = comp; } else items = ld;
+    }
+    if (!items) items = [];
+    let blueprint = ldPre ? ldPre.blueprint : null;
+    let platform = ldPre ? 'compiled' : p;
+    if (ldPre) saveBlueprint(blueprint);
+    if (items.length < 2) {
+      const saved = safeCall(loadBlueprint, 'loadBlueprint');
+      if (saved && saved.selectors && saved.selectors.card) {
+        const reused = safeCall(function () { return applySelectors(saved.selectors); }, 'applySelectors');
+        if (reused && reused.length >= items.length) {
+          items = reused; blueprint = saved; platform = 'compiled';
+        }
+      }
+    }
+    if (items.length < 2) {
+      const compiled = safeCall(compileFromSource, 'compileFromSource') || { items: [] };
+      if ((compiled.items || []).length > items.length) {
+        items = compiled.items;
+        blueprint = compiled.blueprint;
+        platform = compiled.blueprint && compiled.blueprint.method === 'json-ld' ? 'json-ld' : 'compiled';
+        saveBlueprint(blueprint);
+      }
+    }
+    const jsonld = items.length ? (safeCall(scrapeJsonLd, 'scrapeJsonLd(2)') || []) : [];
+    const fin = safeCall(function () { return finalizePage(items, loadOosModel(), jsonld); }, 'finalizePage');
+    const finalItems = (fin && fin.items) || items.map(function (it) { return { title: it.title, price: it.price, oos: !!it.oos, url: it.url || '', rating: it.rating || '', reviews: it.reviews || '' }; });
+    const total = finalItems.length;
+    const soldOut = finalItems.filter(function (it) { return it.oos; }).length;
+    const pool = INCLUDE_OOS ? finalItems : finalItems.filter(function (it) { return !it.oos; });
+    return {
+      platform: platform,
+      items: pool,
+      total: total,
+      soldOut: soldOut,
+      skipped: INCLUDE_OOS ? 0 : soldOut,
+      blueprint: blueprint
+    };
+  }
+
+  /* ============================ PAGINATION & LOAD MORE ============================ */
+  function isDisabledNav(el) {
+    if (!el) return true;
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return true;
+    if (el.disabled) return true;
+    if (el.classList && (el.classList.contains('disabled') || el.classList.contains('s-pagination-disabled') || el.classList.contains('ais-Pagination-item--disabled'))) return true;
+    if (el.closest && el.closest('li.disabled, li.page-item.disabled, .ais-Pagination-item--disabled')) return true;
+    return false;
+  }
+  function pageNumFromHref(href) {
+    if (!href || href === '#' || /^(javascript:|mailto:|tel:)/i.test(href)) return null;
+    try {
+      const u = new URL(href, location.href);
+      const keys = ['page', 'paged', 'product-page', 'pg', 'page_number'];
+      for (let i = 0; i < keys.length; i++) {
+        const q = u.searchParams.get(keys[i]);
+        if (q && /^\d+$/.test(q)) return parseInt(q, 10);
+      }
+      const m = u.pathname.match(/\/page\/(\d+)/i);
+      if (m) return parseInt(m[1], 10);
+      const p = u.searchParams.get('p');
+      if (p && /^\d+$/.test(p)) {
+        const n = parseInt(p, 10);
+        if (n >= 1 && n < 500) return n;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function resolvePagerHref(href) {
+    if (!href || href === '#' || /^(javascript:|mailto:|tel:)/i.test(href)) return null;
+    try {
+      const u = new URL(href, location.href);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        const keys = ['page', 'paged', 'product-page', 'pg', 'page_number', 'p'];
+        const hasPage = keys.some(k => u.searchParams.has(k)) || /\/page\/\d+/i.test(u.pathname);
+        if (hasPage) return u.href;
+
+        const cur = new URL(location.href);
+        u.searchParams.forEach((v, k) => {
+          if (!cur.searchParams.has(k)) cur.searchParams.set(k, v);
+        });
+        return cur.href;
+      }
+    } catch (e) { /* ignore */ }
+    return href;
+  }
+  function currentPageNum() {
+    const fromUrl = pageNumFromHref(location.href);
+    if (fromUrl) return fromUrl;
+    const active = document.querySelector('.page-item.active, li.active, [aria-current="page"], .s-pagination-selected, .current, .ais-Pagination-item--selected');
+    if (active) {
+      const t = parseInt(textOf(active), 10);
+      if (!isNaN(t) && t > 0 && t < 500) return t;
+    }
+    return pageNumFromHref(location.href) || 1;
+  }
+  function pagerNodes() {
+    const sel = '.pagination, ul.pagination, nav.pagination, .yalla-pagination, .s-pagination-strip, nav[aria-label*="pagination" i], .woocommerce-pagination, .pager, .pages, [data-scope="pagination"], .paginate, .wp-pagenavi, .ais-Pagination';
+    const roots = Array.from(document.querySelectorAll(sel));
+    const out = [];
+    const seen = new Set();
+    function add(el) {
+      if (el && !seen.has(el)) { seen.add(el); out.push(el); }
+    }
+    roots.forEach((root) => {
+      root.querySelectorAll('a[href], span, button').forEach(add);
+      add(root);
+    });
+    document.querySelectorAll('a[rel="next"], link[rel="next"], a.s-pagination-next, a.s-pagination-item, a.page-link, a.page-number, a.page-numbers, a.pagination__next, div[title^="Page "]').forEach(add);
+    return out;
+  }
+  function listedPageNumbers() {
+    const nums = [];
+    pagerNodes().forEach((el) => {
+      const n = parseInt(textOf(el), 10);
+      if (!isNaN(n) && n > 0 && n < 500) nums.push(n);
+      const href = el.getAttribute && el.getAttribute('href');
+      const fromHref = pageNumFromHref(href);
+      if (fromHref) nums.push(fromHref);
+    });
+    return nums;
+  }
+  function detectMaxPages() {
+    const nums = Array.from(new Set(listedPageNumbers()));
+    if (nums.length > 1) return Math.max(...nums);
+    return 500;
+  }
+  function findNextAnchor() {
+    const current = currentPageNum();
+    const nextNum = current + 1;
+    const nodes = pagerNodes();
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      if (!a || a.tagName !== 'A') continue;
+      if (isDisabledNav(a)) continue;
+      const href = a.getAttribute('href');
+      if (!href || href === '#' || /javascript:/i.test(href)) continue;
+      const n = pageNumFromHref(href);
+      const txt = parseInt(textOf(a), 10);
+      if (n === nextNum || txt === nextNum) return a;
+    }
+    const labeled = document.querySelectorAll('a[rel="next"][href], link[rel="next"][href], a.s-pagination-next[href], a.pagination__next[href], ul.pagination a.next[href], nav.pagination a.next[href], nav.woocommerce-pagination a.next[href], a.next.page-numbers[href], a.next.page-number[href], a[aria-label*="التالي"][href]');
+    for (let i = 0; i < labeled.length; i++) {
+      const el = labeled[i];
+      if (isDisabledNav(el)) continue;
+      const href = el.getAttribute('href');
+      if (!href || href === '#' || /javascript:/i.test(href)) continue;
+      const n = pageNumFromHref(href);
+      if (n != null && n !== nextNum) continue;
+      return el;
+    }
+    return null;
+  }
+  function findNextHref() {
+    /* [v5.3] Algolia first */
+    const ais = findAlgoliaNext();
+    if (ais) {
+      const href = ais.getAttribute('href');
+      if (href && href !== '#' && !/^javascript:/i.test(href)) {
+        const r = resolvePagerHref(href);
+        if (r) return r;
+      }
+    }
+    const current = currentPageNum();
+    const nextNum = current + 1;
+    const nodes = pagerNodes();
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      if (!a || (a.tagName !== 'A' && a.tagName !== 'LINK')) continue;
+      if (isDisabledNav(a)) continue;
+      const href = a.getAttribute('href');
+      if (!href || href === '#' || /javascript:/i.test(href)) continue;
+      const n = pageNumFromHref(href);
+      const txt = parseInt(textOf(a), 10);
+      if (n === nextNum || txt === nextNum) {
+        const r = resolvePagerHref(href);
+        if (r) return r;
+      }
+    }
+    const labeled = document.querySelectorAll('a[rel="next"][href], link[rel="next"][href], a.s-pagination-next[href], a.pagination__next[href], ul.pagination a.next[href], nav.pagination a.next[href], nav.woocommerce-pagination a.next[href], a.next.page-numbers[href], a.next.page-number[href], a[aria-label*="التالي"][href]');
+    for (let i = 0; i < labeled.length; i++) {
+      const el = labeled[i];
+      if (isDisabledNav(el)) continue;
+      const href = el.getAttribute('href');
+      if (!href || href === '#' || /javascript:/i.test(href)) continue;
+      const n = pageNumFromHref(href);
+      if (n != null && n !== nextNum) continue;
+      const inPager = el.closest('.pagination, ul.pagination, nav.pagination, .yalla-pagination, .s-pagination-strip, .woocommerce-pagination, .pager, .pages, [data-scope="pagination"], .ais-Pagination') || (el.getAttribute('rel') || '').toLowerCase().indexOf('next') !== -1 || el.tagName === 'LINK';
+      if (n == null && !inPager) continue;
+      const r = resolvePagerHref(href);
+      if (r) return r;
+    }
+    const isPageParamSite = /(^|\.)sharafdg\.com$/.test(host);
+    if (!isPageParamSite) {
+      const listed = listedPageNumbers();
+      if (listed.indexOf(nextNum) === -1 && !listed.some(function (n) { return n > current; })) return null;
+    }
+    try {
+      const u = new URL(location.href);
+      let key = ['page', 'paged', 'pg', 'page_number'].find(function (k) { return u.searchParams.has(k); }) ||
+        ((u.searchParams.has('p') && /^\d+$/.test(u.searchParams.get('p') || '')) ? 'p' : null);
+      if (!key && isPageParamSite) key = 'page_number';
+      if (key) { u.searchParams.set(key, String(nextNum)); return u.href; }
+      if (/\/page\/\d+/i.test(u.pathname)) {
+        u.pathname = u.pathname.replace(/\/page\/\d+/i, '/page/' + nextNum);
+        return u.href;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function findNextButton() {
+    /* [v5.3] Algolia first (from v5.1) */
+    const ais = findAlgoliaNext();
+    if (ais && !isDisabledNav(ais)) return ais;
+    const sigma = document.querySelector('[data-scope="pagination"][data-part="next-trigger"]');
+    if (sigma && !isDisabledNav(sigma)) return sigma;
+    const dub = document.querySelector('div[title="Next"]');
+    if (dub && dub.parentElement && dub.parentElement.tagName === 'A' && !isDisabledNav(dub.parentElement)) return dub.parentElement;
+    return null;
+  }
+
+  function findLoadMore() {
+    const amz = document.querySelector('.s-show-more-results-button');
+    if (amz && !amz.closest('.aok-hidden') && amz.getClientRects().length) {
+      const inp = amz.querySelector('input.a-button-input') || amz;
+      if (!isDisabledNav(inp)) return inp;
+    }
+
+    /* [v5.3] Samsung / Vodafone view-more (from v5.1) */
+    const samsung = document.querySelector('.pd21-product-finder__view-more, .js-pfv2-view-more');
+    if (samsung && isVisible(samsung) && !isDisabledNav(samsung) && !inChrome(samsung)) return samsung;
+
+    const sel = document.querySelector([
+      'button.load-more', 'a.load-more', '.load-more:not(.disabled)',
+      '[data-load-more]:not([data-is-prev])', '[data-action="load-more"]',
+      'button[class*="load-more" i]', 'a[class*="load-more" i]',
+      'button[class*="loadmore" i]', 'a[class*="loadmore" i]',
+      'button[class*="view-more" i]', 'a[class*="view-more" i]',
+      'button[class*="viewmore" i]', 'a[class*="viewmore" i]',
+      'button[class*="show-more" i]', 'a[class*="show-more" i]',
+      'button[class*="showmore" i]', 'a[class*="showmore" i]',
+      '[class*="load-more" i]:not(.disabled)', '[class*="loadmore" i]:not(.disabled)',
+      '[class*="view-more" i]:not(.disabled)', '[class*="viewmore" i]:not(.disabled)',
+      '[id*="load-more" i]', '[id*="loadmore" i]',
+      '[id*="view-more" i]', '[id*="viewmore" i]'
+    ].join(', '));
+    if (sel && !isDisabledNav(sel) && !inBoilerplate(sel) && !inHijackZone(sel) && !inFilterZone(sel) && !isInsideCard(sel) && !inChrome(sel)) {
+      if (isVisible(sel)) return sel;
+    }
+
+    /* [v5.3] LOAD_MORE_RE no longer matches bare "more"/"المزيد" */
+    const LOAD_MORE_RE = /(?:load|view|show|see)\s*more|عرض\s*(?:المزيد|اكثر|أكثر)|مشاهدة\s*المزيد|إظهار\s*المزيد|اظهار\s*المزيد|تحميل\s*المزيد|المزيد\s*من\s*(?:المنتجات|الأجهزة|العروض)/i;
+
+    const candidateNodes = document.querySelectorAll('button, a, [role="button"], [class*="btn" i], [class*="button" i], [class*="more" i], div[tabindex], span[tabindex]');
+    for (let i = 0; i < candidateNodes.length; i++) {
+      const el = candidateNodes[i];
+      if (isDisabledNav(el) || inBoilerplate(el) || inHijackZone(el) || inFilterZone(el) || isInsideCard(el) || inChrome(el)) continue;
+      const t = norm(el.textContent);
+      if (!t || t.length > 70) continue;
+      /* [v5.3] skip bare "more"/"المزيد" */
+      if (BARE_MORE.test(t)) continue;
+      if (LOAD_MORE_RE.test(t)) {
+        if (!isVisible(el)) continue;
+        if (looksPrice(t)) continue;
+        return el;
+      }
+    }
+
+    const textEls = document.querySelectorAll('span, p, b, strong');
+    for (let i = 0; i < textEls.length; i++) {
+      const s = textEls[i];
+      if (s.children.length > 2) continue;
+      const t = norm(s.textContent);
+      if (BARE_MORE.test(t)) continue;
+      if (t && t.length <= 40 && LOAD_MORE_RE.test(t)) {
+        const btn = s.closest('button, a, [role="button"], [class*="btn" i], [class*="button" i]') || s;
+        if (btn && !isDisabledNav(btn) && !inBoilerplate(btn) && !inHijackZone(btn) && !inFilterZone(btn) && !isInsideCard(btn) && !inChrome(btn)) {
+          if (!isVisible(btn)) continue;
+          if (looksPrice(norm(btn.textContent))) continue;
+          return btn;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function triggerClick(el) {
+    if (!el) return;
+    try { el.scrollIntoView({ block: 'center' }); } catch (e) { /* ignore */ }
+    const target = el.querySelector('button, a, [role="button"]') || el;
+    const fire = (node) => {
+      if (!node) return;
+      const opts = { bubbles: true, cancelable: true, view: window };
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((evt) => {
+        try { node.dispatchEvent(new MouseEvent(evt, opts)); } catch (e) { /* ignore */ }
+      });
+      try { node.click(); } catch (e) { /* ignore */ }
+    };
+    fire(target);
+    if (target !== el) fire(el);
+    setTimeout(() => {
+      fire(target);
+      if (target !== el) fire(el);
+    }, 150);
+  }
+
+  function mergeItems(existing, incoming) {
+    const seen = new Map();
+    const out = [];
+    (existing || []).concat(incoming || []).forEach((it) => {
+      if (!it || !it.title) return;
+      const k = it.url || it.title.toLowerCase();
+      if (seen.has(k)) {
+        const p = seen.get(k);
+        if (it.oos) p.oos = true;
+        if (!p.rating && it.rating) p.rating = it.rating;
+        if (!p.reviews && it.reviews) p.reviews = it.reviews;
+        return;
+      }
+      const c = { title: it.title, price: it.price, oos: !!it.oos, url: it.url || '', rating: it.rating || '', reviews: it.reviews || '' };
+      seen.set(k, c);
+      out.push(c);
+    });
+    return out;
+  }
+
+  /* ============================ STATE / PANEL / RUN LOOP ============================ */
+  let panelClosed = false;
+  let panelMinimized = false;
+  let fabForced = false;
+  let stepGen = 0;
+  let bootstrapped = false;
+  const STATE_TTL_MS = 120000;
+
+  function emptyState() {
+    return { running: false, page: 0, maxPages: 500, items: [], skipped: 0, sourceUrl: '', loadMoreClicks: 0 };
+  }
+  function loadState() {
+    try {
+      const s = JSON.parse(sessionStorage.getItem(STATE_KEY));
+      if (!s) return emptyState();
+      if (s.running && s.updatedAt && Date.now() - s.updatedAt > STATE_TTL_MS) {
+        return emptyState();
+      }
+      return s;
+    } catch (e) { return emptyState(); }
+  }
+  function saveState(state) {
+    try {
+      state.updatedAt = Date.now();
+      sessionStorage.setItem(STATE_KEY, JSON.stringify(state));
+    } catch (e) { /* ignore */ }
+  }
+  function clearState() { try { sessionStorage.removeItem(STATE_KEY); } catch (e) { /* ignore */ } }
+  function setStatus(msg) {
+    const el = document.getElementById('hv-status');
+    if (el) el.textContent = msg;
+    console.log('[Harvest]', msg);
+  }
+  function escapeMd(str) { return String(str).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim(); }
+
+  function exportToFile(items) {
+    if (!items || !items.length) { setStatus('Nothing to export (all sold out?).'); return; }
+    const tag = safeCall(detectPlatform, 'detectPlatform') || 'unknown';
+    const state = loadState();
+    const sourceUrl = state.sourceUrl || location.href;
+    let siteName = host.replace(/^www\./i, '');
+    try { if (sourceUrl) siteName = new URL(sourceUrl).hostname.replace(/^www\./i, ''); } catch (e) { /* ignore */ }
+    const safeSiteName = siteName.replace(/[^a-z0-9.-]/gi, '_');
+    const bp = state.blueprint || loadBlueprint();
+    const model = loadOosModel();
+    let header = '# ' + (state.platform || tag) + ' listings' + (INCLUDE_OOS ? '' : ' (in stock only)') + '\n\n**Source URL:** ' + sourceUrl + '\n\n';
+    if (bp && bp.selectors && bp.selectors.card) {
+      header += '**Extractor compiled from page source**\n\n```\ncard    ' + bp.selectors.card + '\ntitle   ' + bp.selectors.title + '\nprice   ' + bp.selectors.price + '\n```\n\n';
+    }
+    if (model && model.rules && model.rules.length) {
+      header += '**Learned sold-out markers:** ' + model.rules.slice(0, 10).map((r) => '`' + r + '`').join(' ') + '\n\n';
+    }
+    const withOos = items.some((it) => it.oos);
+    const withRev = items.some((it) => it.rating || it.reviews);
+    const cols = ['#', 'Title', 'Price'].concat(withRev ? ['Rating', 'Reviews'] : [], withOos ? ['Stock'] : []);
+    header += '| ' + cols.join(' | ') + ' |\n|' + cols.map(() => '---').join('|') + '|\n';
+    const rows = items.map((it, i) => {
+      const c = [i + 1, escapeMd(it.title), escapeMd(it.price)];
+      if (withRev) c.push(it.rating ? it.rating + '★' : '—', escapeMd(it.reviews || '—'));
+      if (withOos) c.push(it.oos ? 'sold out' : 'in stock');
+      return '| ' + c.join(' | ') + ' |';
+    });
+    const text = header + rows.join('\n') + '\n';
+    const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = safeSiteName + '-listings-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.md';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    const sold = items.filter((it) => it.oos).length;
+    setStatus('Exported ' + items.length + ' items' + (sold ? ' (' + sold + ' sold out flagged)' : '') + '.');
+  }
+
+  function injectPanel() {
+    if (panelClosed) return;
+    if (document.getElementById('hv-scraper-panel')) return;
+    let preview;
+    try {
+      preview = scrapeCurrentPage();
+    } catch (err) {
+      recordError('scrapeCurrentPage', err);
+      console.error('[Harvest] scrapeCurrentPage crashed:', err);
+      preview = { items: [], total: 0, soldOut: 0, skipped: 0, platform: 'ERROR', blueprint: null, crash: String((err && err.message) || err) };
+    }
+    if (!fabForced && preview.total < 2 && !loadState().running) return;
+    let detectedMax = 500;
+    try { detectedMax = detectMaxPages(); } catch (err) { recordError('detectMaxPages', err); console.error('[Harvest] detectMaxPages crashed:', err); }
+    let model = null;
+    try { model = loadOosModel(); } catch (e) { /* ignore */ }
+    const panel = document.createElement('div');
+    panel.id = 'hv-scraper-panel';
+    panel.style.cssText = 'position:fixed!important;top:80px!important;right:16px!important;z-index:2147483647!important;background:#121410!important;color:#f1f0e8!important;font:13px/1.4 system-ui,sans-serif!important;padding:12px!important;border-radius:12px!important;box-shadow:0 8px 28px rgba(0,0,0,.45)!important;width:250px!important;pointer-events:auto!important;border:1px solid #2a2c26!important;';
+    const compiledNote = preview.blueprint && preview.blueprint.selectors && preview.blueprint.selectors.card
+      ? '<div id="hv-blueprint" style="margin:6px 0 8px;padding:8px;background:#1d1f1a;border-radius:8px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.9;word-break:break-all;">card ' + preview.blueprint.selectors.card + '<br>title ' + preview.blueprint.selectors.title + '<br>price ' + preview.blueprint.selectors.price + '</div>'
+      : '';
+    const modelNote = model && model.rules && model.rules.length
+      ? '<div style="margin:4px 0 8px;font-size:11px;opacity:.6;">learned sold-out markers: ' + model.rules.slice(0, 4).join(', ') + (model.rules.length > 4 ? ' +' + (model.rules.length - 4) : '') + '</div>'
+      : '';
+    const countTxt = preview.crash
+      ? '⚠ crashed: ' + preview.crash.slice(0, 60)
+      : (INCLUDE_OOS ? preview.total + ' listings' : preview.items.length + ' in stock');
+    const soldTxt = preview.crash ? 'see console' : (INCLUDE_OOS ? preview.soldOut + ' sold out (included)' : preview.skipped + ' sold out ignored');
+    panel.innerHTML =
+      '<div id="hv-header" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;cursor:move;user-select:none;touch-action:none;">' +
+        '<div style="font-weight:600;letter-spacing:.02em;">Harvest 5.3.2</div>' +
+        '<div style="display:flex;gap:4px;">' +
+          '<button id="hv-minimize" title="Minimize" style="width:22px;height:22px;line-height:20px;padding:0;cursor:pointer;background:#2a2c26;border:none;color:#f1f0e8;border-radius:6px;font-size:14px;">−</button>' +
+          '<button id="hv-close" title="Close" style="width:22px;height:22px;line-height:20px;padding:0;cursor:pointer;background:#2a2c26;border:none;color:#f1f0e8;border-radius:6px;font-size:14px;">×</button>' +
+        '</div>' +
+      '</div>' +
+      '<div id="hv-body">' +
+        '<div id="hv-status" style="margin-bottom:8px;opacity:.85;">' + countTxt + ' · ' + soldTxt + ' · ' + preview.platform + ' · idle</div>' +
+        compiledNote + modelNote +
+        '<button id="hv-start" style="width:100%;padding:8px;margin-bottom:6px;cursor:pointer;background:#d5ddd0;border:none;color:#121410;border-radius:8px;font-weight:600;">Start scraping</button>' +
+        '<button id="hv-stop" style="width:100%;padding:8px;margin-bottom:6px;cursor:pointer;background:#2a2c26;border:none;color:#f1f0e8;border-radius:8px;">Stop & export</button>' +
+        '<button id="hv-export" style="width:100%;padding:8px;margin-bottom:6px;cursor:pointer;background:#2a2c26;border:none;color:#f1f0e8;border-radius:8px;">Export this page</button>' +
+        '<button id="hv-refresh" style="width:100%;padding:8px;margin-bottom:6px;cursor:pointer;background:#2a2c26;border:none;color:#f1f0e8;border-radius:8px;">Refresh Page Data</button>' +
+        '<label style="display:flex;align-items:center;gap:6px;margin:6px 0 2px;opacity:.9;cursor:pointer;"><input type="checkbox" id="hv-include-oos" style="accent-color:#d5ddd0;"> Include sold-out rows</label>' +
+        '<label style="display:block;margin-top:4px;opacity:.9;">Max pages <input id="hv-maxpages" type="number" value="' + (detectedMax >= 500 ? '' : detectedMax) + '" min="1" max="500" style="width:52px;background:#1d1f1a;color:#f1f0e8;border:1px solid #2a2c26;border-radius:6px;padding:4px 6px;" placeholder="All"></label>' +
+        '<div style="margin-top:8px;font-size:11px;opacity:.55;">Recommendation/upsell widgets are excluded. Sold-out detection learns per site. Ctrl+Alt+H toggles.</div>' +
+      '</div>';
+    document.documentElement.appendChild(panel);
+    document.getElementById('hv-start').addEventListener('click', () => {
+      const val = document.getElementById('hv-maxpages').value;
+      startScraping(val ? parseInt(val, 10) : null);
+    });
+    document.getElementById('hv-stop').addEventListener('click', () => {
+      stepGen += 1;
+      const state = loadState();
+      exportToFile(state.items);
+      clearState();
+      setStatus('Stopped. Exported what was collected.');
+    });
+    document.getElementById('hv-export').addEventListener('click', () => {
+      const state = loadState();
+      if (state.items && state.items.length) exportToFile(state.items);
+      else exportToFile(scrapeCurrentPage().items);
+    });
+    document.getElementById('hv-refresh').addEventListener('click', () => {
+      setStatus('Refreshing data...');
+      setTimeout(() => {
+        const preview = scrapeCurrentPage();
+        const statusEl = document.getElementById('hv-status');
+        if (statusEl) {
+          statusEl.textContent = (INCLUDE_OOS ? preview.total + ' listings' : preview.items.length + ' in stock') + ' · ' + (INCLUDE_OOS ? preview.soldOut + ' sold out (included)' : preview.skipped + ' sold out ignored') + ' · ' + preview.platform + ' · idle';
+        }
+        setStatus('Refreshed. Found ' + (INCLUDE_OOS ? preview.total : preview.items.length) + ' items.');
+      }, 1000);
+    });
+    const inc = document.getElementById('hv-include-oos');
+    inc.checked = INCLUDE_OOS;
+    inc.addEventListener('change', () => {
+      INCLUDE_OOS = inc.checked;
+      const st = loadState();
+      if (st && st.running) { st.includeOos = INCLUDE_OOS; saveState(st); }
+      setStatus('Sold-out rows will ' + (INCLUDE_OOS ? 'be included' : 'be ignored') + ' from now on.');
+    });
+    document.getElementById('hv-minimize').addEventListener('click', () => {
+      panelMinimized = !panelMinimized;
+      const body = document.getElementById('hv-body');
+      if (body) body.style.display = panelMinimized ? 'none' : 'block';
+      document.getElementById('hv-minimize').textContent = panelMinimized ? '+' : '−';
+    });
+    document.getElementById('hv-close').addEventListener('click', () => {
+      panelClosed = true;
+      panel.remove();
+    });
+    makeDraggable(panel, document.getElementById('hv-header'));
+  }
+
+  function makeDraggable(panel, handle) {
+    let dragging = false, offsetX = 0, offsetY = 0;
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button')) return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      offsetX = e.clientX - rect.left;
+      offsetY = e.clientY - rect.top;
+      panel.style.setProperty('left', rect.left + 'px', 'important');
+      panel.style.setProperty('top', rect.top + 'px', 'important');
+      panel.style.setProperty('right', 'auto', 'important');
+      handle.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      e.preventDefault();
+      const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+      const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+      panel.style.setProperty('left', Math.min(Math.max(0, e.clientX - offsetX), maxLeft) + 'px', 'important');
+      panel.style.setProperty('top', Math.min(Math.max(0, e.clientY - offsetY), maxTop) + 'px', 'important');
+    });
+    handle.addEventListener('pointerup', (e) => {
+      dragging = false;
+      if (handle.hasPointerCapture && handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+    });
+    handle.addEventListener('pointercancel', () => { dragging = false; });
+  }
+
+  function startScraping(userMaxPages) {
+    let maxPages = detectMaxPages();
+    if (userMaxPages && !isNaN(userMaxPages)) {
+      maxPages = Math.max(1, Math.min(500, parseInt(userMaxPages, 10)));
+    }
+    const preview = scrapeCurrentPage();
+    saveState({
+      running: true,
+      page: currentPageNum(),
+      maxPages: maxPages,
+      items: [],
+      skipped: 0,
+      lastScrapedPage: 0,
+      scrapedPages: [],
+      loadMoreClicks: 0,
+      stall: 0,
+      scrollPass: 0,
+      sourceUrl: location.href,
+      platform: preview.platform,
+      blueprint: preview.blueprint || loadBlueprint(),
+      includeOos: INCLUDE_OOS
+    });
+    if (preview.blueprint) saveBlueprint(preview.blueprint);
+    stepGen += 1;
+    setStatus('Starting… cap ' + (maxPages >= 500 ? '∞' : maxPages) + ' · ' + preview.platform);
+    runStep();
+  }
+
+  function finishRun(items, msg) {
+    stepGen += 1;
+    exportToFile(items);
+    clearState();
+    setStatus(msg || 'Done.');
+  }
+
+  function runStep() {
+    const myGen = stepGen;
+    if (!loadState().running) return;
+    /* [v5.3] Algolia / Journal3 IAS quiet mode: don't thrash the page */
+    const quiet = isAlgoliaSite() || isIasSite();
+    if (!quiet) {
+      try { window.scrollTo(0, document.body.scrollHeight); } catch (e) { /* ignore */ }
+    }
+    setTimeout(() => {
+      if (stepGen !== myGen) return;
+      if (!quiet) {
+        try { window.scrollTo(0, 0); } catch (e) { /* ignore */ }
+      }
+      collectAndAdvance();
+    }, SCRAPE_SETTLE_MS);
+  }
+
+  function collectAndAdvance() {
+    const state = loadState();
+    if (!state.running) { finishRun(state.items, 'Stopped.'); return; }
+    const preview = scrapeCurrentPage();
+    const before = (state.items || []).length;
+    const merged = mergeItems(state.items, preview.items);
+    const pn = currentPageNum();
+    const scrapedPages = (state.scrapedPages || []).slice();
+    if (scrapedPages.indexOf(pn) === -1) scrapedPages.push(pn);
+    const stall = merged.length === before ? (state.stall || 0) + 1 : 0;
+    const fresh = Object.assign({}, state, {
+      items: merged,
+      skipped: (state.skipped || 0) + preview.skipped,
+      lastScrapedPage: pn,
+      scrapedPages: scrapedPages,
+      stall: stall
+    });
+    saveState(fresh);
+    setStatus('Page ' + pn + ' · +' + preview.items.length + ' here · ' + merged.length + ' total' +
+      (preview.skipped ? ' · ' + preview.skipped + ' sold out ignored' : '') + ' · ' + preview.platform);
+    advance(fresh, merged);
+  }
+
+  function advance(fresh, merged) {
+    const myGen = stepGen;
+    if ((fresh.stall || 0) >= 3) { finishRun(merged, 'No new items — reached the end. Exported ' + merged.length + '.'); return; }
+    const scrapedCount = Math.max((fresh.scrapedPages && fresh.scrapedPages.length) || 0, (fresh.loadMoreClicks || 0) + 1);
+    if (scrapedCount >= fresh.maxPages) { finishRun(merged, 'Page cap reached (' + fresh.maxPages + '). Exported ' + merged.length + '.'); return; }
+
+    const more = findLoadMore();
+    if (more) {
+      fresh.loadMoreClicks = (fresh.loadMoreClicks || 0) + 1;
+      saveState(fresh);
+      setStatus('Loading more items… (pass ' + fresh.loadMoreClicks + ')');
+      triggerClick(more);
+      setTimeout(() => { if (stepGen === myGen) runStep(); }, PAGE_LOAD_WAIT_MS);
+      return;
+    }
+
+    const btn = findNextButton();
+    if (btn) {
+      triggerClick(btn);
+      setTimeout(() => { if (stepGen === myGen) runStep(); }, PAGE_LOAD_WAIT_MS);
+      return;
+    }
+
+    if (/(^|\.)noon\.com$/.test(host)) {
+      const nextA = findNextAnchor();
+      if (nextA) {
+        triggerClick(nextA);
+        setTimeout(() => { if (stepGen === myGen) runStep(); }, PAGE_LOAD_WAIT_MS);
+        return;
+      }
+    }
+
+    const href = findNextHref();
+    if (href) { location.href = href; return; }
+
+    /* [v5.3] Algolia / Journal3 IAS sites: stop cleanly rather than infinite scroll */
+    if (isAlgoliaSite() || isIasSite()) {
+      finishRun(merged, 'No next page. Exported ' + merged.length + '.');
+      return;
+    }
+
+    /* infinite-scroll fallback: scroll to bottom, wait, re-evaluate */
+    try { window.scrollTo(0, document.body.scrollHeight); } catch (e) { /* ignore */ }
+    setTimeout(() => {
+      try { window.scrollBy(0, -500); } catch (e) { /* ignore */ }
+      setTimeout(() => {
+        try { window.scrollTo(0, document.body.scrollHeight); } catch (e) { /* ignore */ }
+      }, 300);
+    }, 600);
+    setTimeout(() => { if (stepGen === myGen) collectAndAdvance(); }, PAGE_LOAD_WAIT_MS + 1500);
+  }
+
+  /* ============================ DEBUG HOOKS ============================ */
+  window.__harvest = {
+    detect: function () {
+      try { return detectPlatform(); } catch (err) { return 'crashed: ' + ((err && err.message) || err); }
+    },
+    links: function () {
+      try {
+        return qsAll(document, 'a[href*="/products/"]').filter(function (a) { return !inHijackZone(a) && !inBoilerplate(a); }).length;
+      } catch (err) { return 'crashed: ' + ((err && err.message) || err); }
+    },
+    clusters: function () {
+      try { return clusterFromSource().map(function (c) { return c.signature + ' × ' + c.cards.length; }); }
+      catch (err) { return 'crashed: ' + ((err && err.message) || err); }
+    },
+    evidence: function (sel) {
+      try {
+        const el = typeof sel === 'string' ? qs(document, sel) : sel;
+        return el ? evidenceFor(el, null) : ('no match for ' + sel);
+      } catch (err) { return 'crashed: ' + ((err && err.message) || err); }
+    },
+    page: function () {
+      try {
+        const r = scrapeCurrentPage();
+        return { platform: r.platform, total: r.total, soldOut: r.soldOut, sample: r.items.slice(0, 3) };
+      } catch (err) {
+        return { error: String((err && err.message) || err), stack: String((err && err.stack) || '') };
+      }
+    },
+    /* [v5.3] pager introspection (from v5.1) */
+    pager: function () {
+      try {
+        return {
+          next: findNextHref(),
+          more: !!findLoadMore(),
+          algolia: !!findAlgoliaNext(),
+          isAlgolia: isAlgoliaSite(),
+          isIas: isIasSite(),
+          current: currentPageNum(),
+          max: detectMaxPages()
+        };
+      } catch (err) { return { error: String((err && err.message) || err) }; }
+    },
+    /* [v5.3.1] price utilities for testing the currency list */
+    price: function (text) {
+      try {
+        return { matches: looksPrice(text), cleaned: cleanPrice(text), prepped: prepPriceText(text) };
+      } catch (err) { return { error: String((err && err.message) || err) }; }
+    },
+    lastError: function () { return LAST_ERROR; }
+  };
+  console.log('[Harvest] v5.3.2 debug ready: __harvest.detect() / links() / clusters() / evidence(sel) / page() / pager() / price(text) / lastError()');
+
+  /* ============================ BOOTSTRAP ============================ */
+  document.addEventListener('keydown', (e) => {
+    if (e.code !== 'KeyH' || e.metaKey) return;
+    const oldCombo = e.altKey && e.shiftKey;
+    const newCombo = e.ctrlKey && e.altKey && !e.shiftKey;
+    if (!oldCombo && !newCombo) return;
+    e.preventDefault();
+    const existing = document.getElementById('hv-scraper-panel');
+    if (existing) { existing.remove(); panelClosed = true; return; }
+    panelClosed = false;
+    fabForced = true;
+    injectPanel();
+  });
+
+  function boot() {
+    if (bootstrapped) return;
+    bootstrapped = true;
+    const state = loadState();
+    if (state.running) {
+      INCLUDE_OOS = !!state.includeOos;
+      setTimeout(injectPanel, PAGE_LOAD_WAIT_MS);
+      setTimeout(runStep, PAGE_LOAD_WAIT_MS + 400);
+    } else {
+      const tryInject = (delay) => {
+        setTimeout(() => {
+          if (panelClosed) return;
+          const existingPanel = document.getElementById('hv-scraper-panel');
+          if (existingPanel) {
+            const preview = scrapeCurrentPage();
+            if (preview.total >= 2) {
+              const statusEl = document.getElementById('hv-status');
+              if (statusEl) {
+                statusEl.textContent = (INCLUDE_OOS ? preview.total + ' listings' : preview.items.length + ' in stock') + ' · ' + (INCLUDE_OOS ? preview.soldOut + ' sold out (included)' : preview.skipped + ' sold out ignored') + ' · ' + preview.platform + ' · idle (auto-updated)';
+              }
+            }
+            return;
+          }
+          injectPanel();
+        }, PAGE_LOAD_WAIT_MS + delay);
+      };
+      tryInject(0);
+      [3000, 6000, 12000].forEach(tryInject);
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();

@@ -1,0 +1,27 @@
+Open Data Scraper — Chrome extension
+
+This is an unpacked extension. It runs on the product listing you already have open.
+It is not a website and it is not on the Chrome Web Store.
+
+Install
+1. Unzip the download. Open the folder named open-data-scraper (it contains manifest.json).
+2. Open chrome://extensions
+3. Turn on Developer mode (top right).
+4. Click Load unpacked and choose the open-data-scraper folder.
+5. Open a catalog page (Amazon search, Noon, Shopify collection, WooCommerce shop, and so on).
+6. Click the Open Data Scraper icon.
+7. Scrape this page, or Crawl next pages.
+8. Download Markdown or CSV. Sold-out rows are left out unless you check the box.
+
+What it does
+- Parsers for Amazon, Noon, DubaiPhone, Sigma, Dubizzle, Shopify, WooCommerce, Sharaf DG, Samsung, Vodafone, Yalla, OpenCart, PrestaShop, Magento, and CS-Cart.
+- Unknown shops: it builds a card / title / price blueprint from the page itself.
+- Sold-out detection from badges, disabled add-to-cart, stock attributes, and JSON-LD.
+- Learns a site's sold-out class and applies it on the next page of a crawl.
+- Arabic and Egyptian prices, including جنيه and Eastern digits. A doubled EGP is collapsed.
+- Skips recommendation, upsell, and related strips.
+- Follows next links, Algolia next, Sigma next, load-more, and infinite scroll.
+- Keeps the crawl going after the popup closes, on the same tab only.
+
+Remove
+chrome://extensions → Open Data Scraper → Remove.

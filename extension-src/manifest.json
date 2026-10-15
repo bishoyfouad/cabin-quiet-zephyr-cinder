@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Open Data Scraper",
+  "version": "1.0.0",
+  "description": "Scrape product listings and prices from the page you are on. Store parsers, sold-out detection, Arabic prices, and pagination.",
+  "permissions": ["storage", "downloads", "scripting"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_title": "Open Data Scraper",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/16.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

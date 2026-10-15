@@ -1,0 +1,166 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #121410;
+  --color-surface: #1b1d18;
+  --color-surface-2: #24271f;
+  --color-fg: #f3f1ea;
+  --color-muted: #a3a79a;
+  --color-faint: #73786c;
+  --color-accent: #d7dece;
+  --color-accent-fg: #151710;
+  --color-line: #31342c;
+  --color-sold: #d27a68;
+  --color-ok: #9cb48a;
+  --color-paper: #f4f1e8;
+  --color-ink: #1c1e17;
+  --color-paper-2: #e7e2d6;
+  --font-sans: "Public Sans", "Segoe UI", sans-serif;
+  --font-display: "Fraunces", Georgia, serif;
+  --radius-card: 1.5rem;
+  --radius-control: 0.5rem;
+}
+
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  html,
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+  }
+}
+
+.stage {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  border-radius: 1rem;
+  min-height: 28rem;
+  padding: 1.25rem;
+}
+
+.stage .shop {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.stage .site-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--color-paper-2);
+  padding-bottom: 0.75rem;
+  font-family: var(--font-display);
+}
+
+.stage .site-header span {
+  color: #5e6258;
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+}
+
+.stage .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: 0.75rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.stage .amz-card,
+.stage .noon-card,
+.stage .nf-product-card,
+.stage .product-card,
+.stage .ais-Hits-item,
+.stage li.product,
+.stage article.tile {
+  background: #fffdf8;
+  border: 1px solid var(--color-paper-2);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.875rem;
+}
+
+.stage h2,
+.stage h3 {
+  font-size: 0.9375rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin: 0;
+}
+
+.stage a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.stage .a-offscreen,
+.stage .price,
+.stage .cost,
+.stage .amount,
+.stage .woocommerce-Price-amount,
+.stage .tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.stage .oos-badge,
+.stage .badge,
+.stage .soon {
+  color: #8d3d32;
+  font-size: 0.75rem;
+}
+
+.stage .recommend {
+  border-top: 1px dashed #c8c2b4;
+  padding-top: 0.75rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.stage .recommend > p {
+  margin: 0;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #6d7166;
+}
+
+.stage a[rel="next"],
+.stage a.next,
+.stage .load-more,
+.stage .ais-Pagination a {
+  align-self: flex-start;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  border: 0;
+  border-radius: 999px;
+  padding: 0.45rem 0.9rem;
+  font: inherit;
+  font-size: 0.8125rem;
+}
+
+.stage .ais-Pagination {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.stage .empty-paste {
+  color: #6d7166;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise {
+    animation: none !important;
+  }
+}
